@@ -424,7 +424,7 @@ func TestBigValues(t *testing.T) {
 // tables on level 3 and 3 tables on level 2. Tables on level 2 have overlap with 2, 4, 3 tables on
 // level 3.
 func TestCompactionFilePicking(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestCompactionFilePicking")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -434,6 +434,7 @@ func TestCompactionFilePicking(t *testing.T) {
 		require.NoError(t, db.Close())
 	}()
 
+	// 10个 table 在l3
 	l3 := db.lc.levels[3]
 	for i := 1; i <= 10; i++ {
 		// Each table has difference of 1 between smallest and largest key.
@@ -442,6 +443,7 @@ func TestCompactionFilePicking(t *testing.T) {
 		require.NoError(t, l3.replaceTables([]*table.Table{}, []*table.Table{tab}))
 	}
 
+	// 3个 table 在l2
 	l2 := db.lc.levels[2]
 	// First table has keys 1 and 4.
 	tab := createTableWithRange(t, db, 1, 4)

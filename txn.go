@@ -70,14 +70,15 @@ func newOracle(opt Options) *oracle {
 		isManaged:       opt.managedTxns,
 		detectConflicts: opt.DetectConflicts,
 		// We're not initializing nextTxnTs and readOnlyTs. It would be done after replay in Open.
-		//
 		// WaterMarks must be 64-bit aligned for atomic package, hence we must use pointers here.
 		// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 		readMark: &y.WaterMark{Name: "badger.PendingReads"},
 		txnMark:  &y.WaterMark{Name: "badger.TxnTimestamp"},
 		closer:   z.NewCloser(2),
 	}
+	// read 读取水位线
 	orc.readMark.Init(orc.closer)
+	// 事务提交 水位线
 	orc.txnMark.Init(orc.closer)
 	return orc
 }
@@ -94,14 +95,17 @@ func (o *oracle) readTs() uint64 {
 	var readTs uint64
 	o.Lock()
 	readTs = o.nextTxnTs - 1
+	// 装填水印, 底层会一直等待此水印, 直到被关闭,然后才会执行下一个 readTs;
 	o.readMark.Begin(readTs)
 	o.Unlock()
 
 	// Wait for all txns which have no conflicts, have been assigned a commit
-	// timestamp and are going through the write to value log and LSM tree
-	// process. Not waiting here could mean that some txns which have been
-	// committed would not be read.
-	y.Check(o.txnMark.WaitForMark(context.Background(), readTs))
+	// timestamp and are going through the write to value log and LSM tree process.
+	// 等待所有txn, 包括:没有冲突的,已经分配了但是没有提交的,正在写日志的;
+	// Not waiting here could mean that some txns which have been committed would not be read.
+	// 不再这里等待, 意味着 某些事务已经提交;
+	err := o.txnMark.WaitForMark(context.Background(), readTs)
+	y.Check(err)
 	return readTs
 }
 
@@ -137,9 +141,11 @@ func (o *oracle) discardAtOrBelow() uint64 {
 
 // hasConflict must be called while having a lock.
 func (o *oracle) hasConflict(txn *Txn) bool {
+	// 当前事务 没有读取任何数据, 直接返回;
 	if len(txn.reads) == 0 {
 		return false
 	}
+	// 判断当前事务是否与已提交的事务存在冲突;
 	for _, committedTxn := range o.committedTxns {
 		// If the committedTxn.ts is less than txn.readTs that implies that the
 		// committedTxn finished before the current transaction started.
@@ -147,17 +153,24 @@ func (o *oracle) hasConflict(txn *Txn) bool {
 		// This change assumes linearizability. Lack of linearizability could
 		// cause the read ts of a new txn to be lower than the commit ts of
 		// a txn before it (@mrjn).
+		// readTs = nextTs-1
+		// commitTs = nextTs; nextTs++;
+		// 当前事务ts 大于 之前提交过的事务ts,说明当前事务是在上一个事务提交后创建的,可以通行;
 		if committedTxn.ts <= txn.readTs {
 			continue
 		}
-
+		// committedTxn.ts > txn.readTs; 说明后来的事务已经提交, 前面的事务准备提交前的检测;
+		// 当前事务是 之前创建并未提交的 旧事务; 需要判断是否 读过数据;
+		// 1. 没有读过数据: 即便是提交相同的key, 也可以进行提交;
+		// 2. 读过数据: 1) 没有发生冲突, 可继续提交;
+		//             2) 发生了冲突, 则需要重新创建事务;
 		for _, ro := range txn.reads {
+			// 判断之前的提交记录, 是否和如今的读取记录有冲突;
 			if _, has := committedTxn.conflictKeys[ro]; has {
 				return true
 			}
 		}
 	}
-
 	return false
 }
 
@@ -165,37 +178,45 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 	o.Lock()
 	defer o.Unlock()
 
+	// 只要当前是否没有读过数据,直接可提交;
 	if o.hasConflict(txn) {
 		return 0, true
 	}
 
-	var ts uint64
+	// 走到这里说明是没有发生冲突;
+	var commitTs uint64
+	// 默认是 系统来管理事务;
 	if !o.isManaged {
+		// 结束掉当前的 txn.readTs 标记;
 		o.doneRead(txn)
+		// 1.先清除掉 之前的事务旧提交记录;
 		o.cleanupCommittedTransactions()
 
 		// This is the general case, when user doesn't specify the read and commit ts.
-		ts = o.nextTxnTs
+		// 这是用户未指定读取和提交 ts 时的一般情况;
+		commitTs = o.nextTxnTs
 		o.nextTxnTs++
-		o.txnMark.Begin(ts)
-
-	} else {
+		// doneRead, 和txnMark.Begin(ts);
+		o.txnMark.Begin(commitTs)
+	} else { // 写操作
 		// If commitTs is set, use it instead.
-		ts = txn.commitTs
+		commitTs = txn.commitTs
 	}
 
-	y.AssertTrue(ts >= o.lastCleanupTs)
+	y.AssertTrue(commitTs >= o.lastCleanupTs)
 
+	// 数据层面开启了,事务冲突检测, 就把当前事务的数据添加进去;
+	// 冲突仅仅是在其他事务读取过数据时, 才开始检测的,否者不进行进一步的检测;
 	if o.detectConflicts {
 		// We should ensure that txns are not added to o.committedTxns slice when
 		// conflict detection is disabled otherwise this slice would keep growing.
+		// 2.将自己添加进去
 		o.committedTxns = append(o.committedTxns, committedTxn{
-			ts:           ts,
+			ts:           commitTs,
 			conflictKeys: txn.conflictKeys,
 		})
 	}
-
-	return ts, false
+	return commitTs, false
 }
 
 func (o *oracle) doneRead(txn *Txn) {
@@ -216,6 +237,7 @@ func (o *oracle) cleanupCommittedTransactions() { // Must be called under o.Lock
 	if o.isManaged {
 		maxReadTs = o.discardTs
 	} else {
+		// 默认读取水位线, 默认是事务提交水位线;
 		maxReadTs = o.readMark.DoneUntil()
 	}
 
@@ -229,11 +251,11 @@ func (o *oracle) cleanupCommittedTransactions() { // Must be called under o.Lock
 	o.lastCleanupTs = maxReadTs
 
 	tmp := o.committedTxns[:0]
-	for _, txn := range o.committedTxns {
-		if txn.ts <= maxReadTs {
+	for _, committedTxn := range o.committedTxns {
+		if committedTxn.ts <= maxReadTs {
 			continue
 		}
-		tmp = append(tmp, txn)
+		tmp = append(tmp, committedTxn)
 	}
 	o.committedTxns = tmp
 }
@@ -259,7 +281,7 @@ type Txn struct {
 	conflictKeys map[uint64]struct{}
 	readsLock    sync.Mutex // guards the reads slice. See addReadKey.
 
-	pendingWrites   map[string]*Entry // cache stores any writes done by txn.
+	pendingWrites   map[string]*Entry // cache stores any writes done by txn. 在当前Txn未提交前,保存所有kv;
 	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries.
 
 	numIterators atomic.Int32
@@ -347,6 +369,7 @@ func (txn *Txn) checkSize(e *Entry) error {
 	count := txn.count + 1
 	// Extra bytes for the version in key.
 	size := txn.size + e.estimateSizeAndSetThreshold(txn.db.valueThreshold()) + 10
+	// 现在内存中的事务的kv对树 大于 count; 直接返回错误;
 	if count >= txn.db.opt.maxBatchCount || size >= txn.db.opt.maxBatchSize {
 		return ErrTxnTooBig
 	}
@@ -376,7 +399,7 @@ func (txn *Txn) modify(e *Entry) error {
 		// keep things safe and allow badger move prefix and a timestamp suffix, let's
 		// cut it down to 65000, instead of using 65536.
 		return exceedsSize("Key", maxKeySize, e.Key)
-	case int64(len(e.Value)) > txn.db.opt.ValueLogFileSize:
+	case int64(len(e.Value)) > txn.db.opt.ValueLogFileSize: // value 大于一个vlogFileSize了都;
 		return exceedsSize("Value", txn.db.opt.ValueLogFileSize, e.Value)
 	case txn.db.opt.InMemory && int64(len(e.Value)) > txn.db.valueThreshold():
 		return exceedsSize("Value", txn.db.valueThreshold(), e.Value)
@@ -386,22 +409,29 @@ func (txn *Txn) modify(e *Entry) error {
 		return err
 	}
 
+	// 检查当前 Tx 是否还有空间存放, 并且设置 e.valThreshold;
 	if err := txn.checkSize(e); err != nil {
 		return err
 	}
 
-	// The txn.conflictKeys is used for conflict detection. If conflict detection
-	// is disabled, we don't need to store key hashes in this map.
-	if txn.db.opt.DetectConflicts {
-		fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
-		txn.conflictKeys[fp] = struct{}{}
+	// The txn.conflictKeys is used for conflict detection.
+	// If conflict detection is disabled, we don't need to store key hashes in this map.
+	// 判断整个事务管理器是否开启事务冲突检测; 假如开启的话, 那么当前事务在提交时,就会判断其他事务是否含有当前事务数据;
+	if txn.db.opt.DetectConflicts { // 当前事务开启冲突检测; 默认都开启;
+		fp := z.MemHash(e.Key)            // Avoid dealing with byte arrays. 避免处理字节数组;
+		txn.conflictKeys[fp] = struct{}{} // 目的: 提交时,将本次涉及到的key和其他提交记录进行对比;
 	}
+
 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
-	// Add the entry to duplicateWrites only if both the entries have different versions. For
-	// same versions, we will overwrite the existing entry.
-	if oldEntry, ok := txn.pendingWrites[string(e.Key)]; ok && oldEntry.version != e.version {
+	// Add the entry to duplicateWrites only if both the entries have different versions.
+	// For same versions, we will overwrite the existing entry.
+	oldEntry, ok := txn.pendingWrites[string(e.Key)]
+	if ok && oldEntry.version != e.version { // 什么情景下, 会出现版本不一致呢? 在未提交前, 版本默认都是0啊;
+		// 存在旧版本,并且版本号不一致, 将旧的移动到duplicateWrites中,等候发落;
 		txn.duplicateWrites = append(txn.duplicateWrites, oldEntry)
 	}
+
+	// 未提交前, 先预存在内存中,只保留最新的e;
 	txn.pendingWrites[string(e.Key)] = e
 	return nil
 }
@@ -445,7 +475,7 @@ func (txn *Txn) Delete(key []byte) error {
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
-	} else if txn.discarded {
+	} else if txn.discarded { // 当前事务无效;
 		return nil, ErrDiscardedTxn
 	}
 
@@ -454,7 +484,10 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	}
 
 	item = new(Item)
+	// 事务在 写模式下,说明是写入数据的事务;
+	// 自己写过的, 先读自己的;
 	if txn.update {
+		// 原生 key;
 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
 			if isDeletedOrExpired(e.meta, e.ExpiresAt) {
 				return nil, ErrKeyNotFound
@@ -470,13 +503,15 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 			// We probably don't need to set db on item here.
 			return item, nil
 		}
-		// Only track reads if this is update txn. No need to track read if txn serviced it
-		// internally.
+		// Only track reads if this is update txn. No need to track read if txn serviced it internally.
+		// 说明内存中不存在key, 需要lsm中读取key;
+		// 当前事务提交时, 会根据此来判断;
 		txn.addReadKey(key)
 	}
 
-	seek := y.KeyWithTs(key, txn.readTs)
-	vs, err := txn.db.get(seek)
+	// 装上 max - Ts;
+	keyMaxReadTs := y.KeyWithTs(key, txn.readTs)
+	vs, err := txn.db.get(keyMaxReadTs)
 	if err != nil {
 		return nil, y.Wrapf(err, "DB::Get key: %q", key)
 	}
@@ -532,39 +567,46 @@ func (txn *Txn) Discard() {
 func (txn *Txn) commitAndSend() (func() error, error) {
 	orc := txn.db.orc
 	// Ensure that the order in which we get the commit timestamp is the same as
-	// the order in which we push these updates to the write channel. So, we
-	// acquire a writeChLock before getting a commit timestamp, and only release
-	// it after pushing the entries to it.
+	// the order in which we push these updates to the write channel.
+	// So, we acquire a writeChLock before getting a commit timestamp,
+	// and only release it after pushing the entries to it.
 	orc.writeChLock.Lock()
 	defer orc.writeChLock.Unlock()
-
+	// 检测是否存在key冲突;  o.doneRead(txn);
 	commitTs, conflict := orc.newCommitTs(txn)
+
 	if conflict {
+		// 存在冲突直接返回当前事务;
 		return nil, ErrConflict
 	}
 
-	keepTogether := true
+	keepTogether := true // 是否把数据统一在一个 事务中;
 	setVersion := func(e *Entry) {
 		if e.version == 0 {
 			e.version = commitTs
 		} else {
+			// 存在额外的版本号, 那就分开标志位分开;
 			keepTogether = false
 		}
 	}
+
 	for _, e := range txn.pendingWrites {
 		setVersion(e)
 	}
+
 	// The duplicateWrites slice will be non-empty only if there are duplicate
 	// entries with different versions.
+	// 只有当存在不同版本的重复条目时，duplicateWrites片才不为空。
 	for _, e := range txn.duplicateWrites {
+		// 重复的旧条目也设置成相同版本? 只是value不同?
 		setVersion(e)
 	}
 
 	entries := make([]*Entry, 0, len(txn.pendingWrites)+len(txn.duplicateWrites)+1)
 
 	processEntry := func(e *Entry) {
-		// Suffix the keys with commit ts, so the key versions are sorted in
-		// descending order of commit timestamp.
+		// Suffix the keys with commit ts, so the key versions are sorted in descending order of commit timestamp.
+		// commitTs 递增, 因此 key version(max - commitTs) 递减;
 		e.Key = y.KeyWithTs(e.Key, e.version)
 		// Add bitTxn only if these entries are part of a transaction. We
 		// support SetEntryAt(..) in managed mode which means a single
@@ -590,6 +632,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		processEntry(e)
 	}
 
+	// 都在一个事务的话, 设置一个事务结束语;
 	if keepTogether {
 		// CommitTs should not be zero if we're inserting transaction markers.
 		y.AssertTrue(commitTs != 0)
@@ -601,12 +644,15 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		entries = append(entries, e)
 	}
 
+	// 发送到db的专门写通道中, db.writeCh <- req
 	req, err := txn.db.sendToWriteCh(entries)
 	if err != nil {
 		orc.doneCommit(commitTs)
 		return nil, err
 	}
+
 	ret := func() error {
+		// 阻塞等待,写入lsm结果, 然后才允许 结束当前水印;
 		err := req.Wait()
 		// Wait before marking commitTs as done.
 		// We can't defer doneCommit above, because it is being called from a
@@ -623,6 +669,7 @@ func (txn *Txn) commitPrecheck() error {
 	}
 	keepTogether := true
 	for _, e := range txn.pendingWrites {
+		// 什么情况下会发生 e.version 有值的?
 		if e.version != 0 {
 			keepTogether = false
 		}
@@ -633,7 +680,7 @@ func (txn *Txn) commitPrecheck() error {
 	// someone uses txn.Commit instead of txn.CommitAt in managed mode.  This
 	// should happen only in managed mode. In normal mode, keepTogether will
 	// always be true.
-	if keepTogether && txn.db.opt.managedTxns && txn.commitTs == 0 {
+	if keepTogether && txn.db.opt.managedTxns && txn.commitTs == 0 { // 如果在手动模式下, commitTS 不可为0;
 		return errors.New("CommitTs cannot be zero. Please use commitAt instead")
 	}
 	return nil
@@ -658,19 +705,22 @@ func (txn *Txn) commitPrecheck() error {
 // If error is nil, the transaction is successfully committed. In case of a non-nil error, the LSM
 // tree won't be updated, so there's no need for any rollback.
 func (txn *Txn) Commit() error {
-	// txn.conflictKeys can be zero if conflict detection is turned off. So we
-	// should check txn.pendingWrites.
-	if len(txn.pendingWrites) == 0 {
-		// Discard the transaction so that the read is marked done.
-		txn.Discard()
-		return nil
-	}
-	// Precheck before discarding txn.
+	// txn.conflictKeys can be zero if conflict detection is turned off.
+	// So we should check txn.pendingWrites.
+	//if len(txn.pendingWrites) == 0 {
+	//	// Discard the transaction so that the read is marked done.
+	//	txn.Discard()
+	//	return nil
+	//}
+
+	// Pre check before discarding txn. 简单检查;
 	if err := txn.commitPrecheck(); err != nil {
 		return err
 	}
+	// 设置 当前 readTs.done()
 	defer txn.Discard()
 
+	// 开始新建 commit和发送数据;
 	txnCb, err := txn.commitAndSend()
 	if err != nil {
 		return err
@@ -781,20 +831,23 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 		count:  1,                       // One extra entry for BitFin.
 		size:   int64(len(txnKey) + 10), // Some buffer for the extra entry.
 	}
+	// 当前事务涉及到写;
 	if update {
-		if db.opt.DetectConflicts {
+		if db.opt.DetectConflicts { // 开启冲突检查;
 			txn.conflictKeys = make(map[uint64]struct{})
 		}
 		txn.pendingWrites = make(map[string]*Entry)
 	}
+	// 是否 手动管理. 默认是自动管理;
 	if !isManaged {
+		// readTs = nextTs - 1;
 		txn.readTs = db.orc.readTs()
 	}
 	return txn
 }
 
-// View executes a function creating and managing a read-only transaction for the user. Error
-// returned by the function is relayed by the View method.
+// View executes a function creating and managing a read-only transaction for the user.
+// Error returned by the function is relayed by the View method.
 // If View is used with managed transactions, it would assume a read timestamp of MaxUint64.
 func (db *DB) View(fn func(txn *Txn) error) error {
 	if db.IsClosed() {
@@ -802,12 +855,13 @@ func (db *DB) View(fn func(txn *Txn) error) error {
 	}
 	var txn *Txn
 	if db.opt.managedTxns {
+		// 最大的 版本;
 		txn = db.NewTransactionAt(math.MaxUint64, false)
 	} else {
+		// 紧接着的版本;
 		txn = db.NewTransaction(false)
 	}
 	defer txn.Discard()
-
 	return fn(txn)
 }
 

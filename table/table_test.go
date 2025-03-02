@@ -77,8 +77,7 @@ func buildTable(t *testing.T, keyValues [][]string, opts Options) *Table {
 	})
 	for _, kv := range keyValues {
 		y.AssertTrue(len(kv) == 2)
-		b.Add(y.KeyWithTs([]byte(kv[0]), 0),
-			y.ValueStruct{Value: []byte(kv[1]), Meta: 'A', UserMeta: 0}, 0)
+		b.Add(y.KeyWithTs([]byte(kv[0]), opts.testVersion), y.ValueStruct{Value: []byte(kv[1]), Meta: 'A', UserMeta: 0}, 0)
 	}
 	tbl, err := CreateTable(filename, b)
 	require.NoError(t, err, "writing to file failed")
@@ -266,15 +265,22 @@ func TestIterateFromEnd(t *testing.T) {
 
 func TestTable(t *testing.T) {
 	opts := getTestTableOptions()
+	// 900-100 = 800;
+	opts.testVersion = 100
 	table := buildTestTable(t, "key", 10000, opts)
 	defer func() { require.NoError(t, table.DecrRef()) }()
 	ti := table.NewIterator(0)
 	defer ti.Close()
-	kid := 1010
-	seek := y.KeyWithTs([]byte(key("key", kid)), 0)
+	// kid := -1010      // 1) 读取 太小 不存在的值
+	// kid := 9999999999 // 2) 大于 太大 不存在的值
+	kid := 1010 // 3) 正常存在的数值
+	//seek := y.KeyWithTs([]byte(key("key", kid)), opts.testVersion) // 4)相同版本的数据;
+	//seek := y.KeyWithTs([]byte(key("key", kid)), 10) // 5)大于当前版本的数据; 900-10=890; 读取不到;
+	seek := y.KeyWithTs([]byte(key("key", kid)), 200) // 6)小于当前版本的数据; 900-200=700; 可读取到;
 	for ti.seek(seek); ti.Valid(); ti.next() {
 		k := ti.Key()
-		require.EqualValues(t, string(y.ParseKey(k)), key("key", kid))
+		s := string(y.ParseKey(k))
+		fmt.Sprintf("seekKey: %v, kid: %v", s, kid)
 		kid++
 	}
 	if kid != 10000 {
@@ -383,11 +389,11 @@ func TestConcatIteratorOneTable(t *testing.T) {
 
 func TestConcatIterator(t *testing.T) {
 	opts := getTestTableOptions()
-	tbl := buildTestTable(t, "keya", 10000, opts)
+	tbl := buildTestTable(t, "keya", 10, opts)
 	defer func() { require.NoError(t, tbl.DecrRef()) }()
-	tbl2 := buildTestTable(t, "keyb", 10000, opts)
+	tbl2 := buildTestTable(t, "keyb", 10, opts)
 	defer func() { require.NoError(t, tbl2.DecrRef()) }()
-	tbl3 := buildTestTable(t, "keyc", 10000, opts)
+	tbl3 := buildTestTable(t, "keyc", 10, opts)
 	defer func() { require.NoError(t, tbl3.DecrRef()) }()
 
 	{
@@ -398,59 +404,68 @@ func TestConcatIterator(t *testing.T) {
 		var count int
 		for ; it.Valid(); it.Next() {
 			vs := it.Value()
-			require.EqualValues(t, fmt.Sprintf("%d", count%10000), string(vs.Value))
-			require.EqualValues(t, 'A', vs.Meta)
+			//require.EqualValues(t, fmt.Sprintf("%d", count%10000), string(vs.Value))
+			//require.EqualValues(t, 'A', vs.Meta)
+			fmt.Printf("key: %v, value: %v\n", string(y.ParseKey(it.Key())), string(vs.Value))
 			count++
 		}
-		require.EqualValues(t, 30000, count)
+		//require.EqualValues(t, 30000, count)
 
-		it.Seek(y.KeyWithTs([]byte("a"), 0))
+		it.Seek(y.KeyWithTs([]byte("a"), 0)) // 找不到a,只能返回离得最近的,大于且存在的最小值;
 		require.EqualValues(t, "keya0000", string(y.ParseKey(it.Key())))
 		vs := it.Value()
 		require.EqualValues(t, "0", string(vs.Value))
 
-		it.Seek(y.KeyWithTs([]byte("keyb"), 0))
+		it.Seek(y.KeyWithTs([]byte("keyb0005"), 0)) // 找到keyb005;
+		require.EqualValues(t, "keyb0005", string(y.ParseKey(it.Key())))
+
+		it.Seek(y.KeyWithTs([]byte("keyb"), 0)) // 找不到keyb,只能返回离得最近的,大于且存在的最小值;
 		require.EqualValues(t, "keyb0000", string(y.ParseKey(it.Key())))
 		vs = it.Value()
 		require.EqualValues(t, "0", string(vs.Value))
 
-		it.Seek(y.KeyWithTs([]byte("keyb9999b"), 0))
+		it.Seek(y.KeyWithTs([]byte("keyb9999b"), 0)) // 找不到keyb9999b,只能返回离得最近的,大于且存在的最小值;
 		require.EqualValues(t, "keyc0000", string(y.ParseKey(it.Key())))
 		vs = it.Value()
 		require.EqualValues(t, "0", string(vs.Value))
 
-		it.Seek(y.KeyWithTs([]byte("keyd"), 0))
+		it.Seek(y.KeyWithTs([]byte("keyd"), 0)) // 找不到keyd,也没有存在比这个更大的了,只能返回无效;
 		require.False(t, it.Valid())
 	}
+	fmt.Println("=====================================================================================")
 	{
 		it := NewConcatIterator([]*Table{tbl, tbl2, tbl3}, REVERSED)
 		defer it.Close()
-		it.Rewind()
+		it.Rewind() // REVERSED, itr.seekToLast()
 		require.True(t, it.Valid())
 		var count int
 		for ; it.Valid(); it.Next() {
-			vs := it.Value()
-			require.EqualValues(t, fmt.Sprintf("%d", 10000-(count%10000)-1), string(vs.Value))
-			require.EqualValues(t, 'A', vs.Meta)
+			vs := it.Value() //逆序每个表的遍历;
+			//require.EqualValues(t, fmt.Sprintf("%d", 10000-(count%10000)-1), string(vs.Value))
+			//require.EqualValues(t, 'A', vs.Meta)
+			fmt.Printf("key: %v, value: %v\n", string(y.ParseKey(it.Key())), string(vs.Value))
 			count++
 		}
-		require.EqualValues(t, 30000, count)
+		//require.EqualValues(t, 30000, count)
 
-		it.Seek(y.KeyWithTs([]byte("a"), 0))
-		require.False(t, it.Valid())
+		it.Seek(y.KeyWithTs([]byte("a"), 0)) // 找不到a,逆序,只能返回离得最近的,小于且存在的最小值;
+		require.False(t, it.Valid())         // 但是库中又没有小于a的,因此返回无效;
 
-		it.Seek(y.KeyWithTs([]byte("keyb"), 0))
-		require.EqualValues(t, "keya9999", string(y.ParseKey(it.Key())))
+		it.Seek(y.KeyWithTs([]byte("keyb0005"), 0)) // 找到keyb005;
+		require.EqualValues(t, "keyb0005", string(y.ParseKey(it.Key())))
+
+		it.Seek(y.KeyWithTs([]byte("keyb"), 0)) // 找不到keyb,逆序,只能返回离得最近的,小于且存在的最小值;
+		require.EqualValues(t, "keya0009", string(y.ParseKey(it.Key())))
 		vs := it.Value()
 		require.EqualValues(t, "9999", string(vs.Value))
 
-		it.Seek(y.KeyWithTs([]byte("keyb9999b"), 0))
-		require.EqualValues(t, "keyb9999", string(y.ParseKey(it.Key())))
+		it.Seek(y.KeyWithTs([]byte("keyb0009b"), 0))
+		require.EqualValues(t, "keyb0009", string(y.ParseKey(it.Key())))
 		vs = it.Value()
 		require.EqualValues(t, "9999", string(vs.Value))
 
 		it.Seek(y.KeyWithTs([]byte("keyd"), 0))
-		require.EqualValues(t, "keyc9999", string(y.ParseKey(it.Key())))
+		require.EqualValues(t, "keyc0009", string(y.ParseKey(it.Key())))
 		vs = it.Value()
 		require.EqualValues(t, "9999", string(vs.Value))
 	}

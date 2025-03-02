@@ -87,7 +87,7 @@ type Options struct {
 	ValueLogMaxEntries uint32
 
 	NumCompactors        int
-	CompactL0OnClose     bool
+	CompactL0OnClose     bool // 是否禁止压缩l0层;
 	LmaxCompaction       bool
 	ZSTDCompressionLevel int
 
@@ -119,8 +119,11 @@ type Options struct {
 	ExternalMagicVersion uint16
 
 	// Transaction start and commit timestamps are managed by end-user.
+	// 事务开始和提交时间戳由最终用户管理;
 	// This is only useful for databases built on top of Badger (like Dgraph).
+	// 这只对建立在Badger之上的数据库有用(比如Dgraph);
 	// Not recommended for most users.
+	// 不建议大多数用户使用; 开启意味着 时间戳完全由 用户指定; 默认关闭;
 	managedTxns bool
 
 	// 4. Flags for testing purposes
@@ -154,7 +157,7 @@ func DefaultOptions(path string) Options {
 		BloomFalsePositive:      0.01,
 		BlockSize:               4 * 1024,
 		SyncWrites:              false,
-		NumVersionsToKeep:       1,
+		NumVersionsToKeep:       1, //
 		CompactL0OnClose:        false,
 		VerifyValueChecksum:     false,
 		Compression:             options.Snappy,

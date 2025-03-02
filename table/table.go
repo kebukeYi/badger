@@ -84,6 +84,9 @@ type Options struct {
 
 	// ZSTDCompressionLevel is the ZSTD compression level used for compressing blocks.
 	ZSTDCompressionLevel int
+
+	// mmy temp debug
+	testVersion uint64
 }
 
 // TableInterface is useful for testing.
@@ -305,6 +308,7 @@ func OpenTable(mf *z.MmapFile, opts Options) (*Table, error) {
 	// Caller is given one reference.
 	t.ref.Store(1)
 
+	// todo 新 .sst 初始化 最大值最小值;
 	if err := t.initBiggestAndSmallest(); err != nil {
 		return nil, y.Wrapf(err, "failed to initialize table")
 	}
@@ -315,7 +319,6 @@ func OpenTable(mf *z.MmapFile, opts Options) (*Table, error) {
 			return nil, y.Wrapf(err, "failed to verify checksum")
 		}
 	}
-
 	return t, nil
 }
 
@@ -402,7 +405,8 @@ func (t *Table) initBiggestAndSmallest() error {
 	if ko, err = t.initIndex(); err != nil {
 		return y.Wrapf(err, "failed to read index.")
 	}
-
+	// 获得最小值key
+	// key: key:max-commitTS, version: commitTs;
 	t.smallest = y.Copy(ko.KeyBytes())
 
 	it2 := t.NewIterator(REVERSED | NOCACHE)
@@ -411,6 +415,8 @@ func (t *Table) initBiggestAndSmallest() error {
 	if !it2.Valid() {
 		return y.Wrapf(it2.err, "failed to initialize biggest for table %s", t.Filename())
 	}
+	// 获得最大值key
+	// key: key:max-commitTS, version: commitTs;
 	t.biggest = y.Copy(it2.Key())
 	return nil
 }
@@ -480,7 +486,9 @@ func (t *Table) initIndex() (*fb.BlockOffset, error) {
 	t.hasBloomFilter = len(index.BloomFilterBytes()) > 0
 
 	var bo fb.BlockOffset
-	y.AssertTrue(index.Offsets(&bo, 0))
+	// 设置 block
+	offsets := index.Offsets(&bo, 0)
+	y.AssertTrue(offsets)
 	return &bo, nil
 }
 
@@ -593,7 +601,7 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 			"corrupted or the table options are incorrectly set")
 	}
 
-	// Read checksum and store it
+	// Read checksum and store it.
 	readPos -= blk.chkLen
 	blk.checksum = blk.data[readPos : readPos+blk.chkLen]
 	// Move back and read numEntries in the block.

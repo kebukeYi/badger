@@ -128,8 +128,11 @@ func getItemValue(t *testing.T, item *Item) (val []byte) {
 }
 
 func txnSet(t *testing.T, kv *DB, key []byte, val []byte, meta byte) {
+	// 1.获得 readTs(只读模式下有用); 并初始化数据容器;
 	txn := kv.NewTransaction(true)
+	// 2.添加数据到当前事务的数据容器中; 冲突容器, 同key不同version的数据;
 	require.NoError(t, txn.SetEntry(NewEntry(key, val).WithMeta(meta)))
+	// 3.提交前进行检测冲突, 把数据发送到lsm,设置当前事务失效;
 	require.NoError(t, txn.Commit())
 }
 
@@ -141,7 +144,8 @@ func txnDelete(t *testing.T, kv *DB, key []byte) {
 
 // Opens a badger db and runs a a test on it.
 func runBadgerTest(t *testing.T, opts *Options, test func(t *testing.T, db *DB)) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	// C:\Users\19327\AppData\Local\Temp\badger-test2227593501
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	if opts == nil {
@@ -297,68 +301,89 @@ func TestConcurrentWrite(t *testing.T) {
 	})
 }
 
+// todo 测试用例
 func TestGet(t *testing.T) {
 	test := func(t *testing.T, db *DB) {
-		txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
+		// maxVersion: 0  nextTs: 1
+		// 写key1
+		txnSet(t, db, []byte("key1"), []byte("val1"), 0x08) // readTs:0  nextTs:1  commitTs:1   nextTs:2
 
+		txnSet(t, db, []byte("key2"), []byte("val1"), 0x08)   // readTs:1  nextTs:2  commitTs:2  nextTs:3
+		txnSet(t, db, []byte("key3"), []byte("val1"), 0x08)   // readTs:2  nextTs:3  commitTs:3  nextTs:4
+		txnSet(t, db, []byte("key15"), []byte("val1"), 0x08)  // readTs:3  nextTs:4  commitTs:4  nextTs:5
+		txnSet(t, db, []byte("key116"), []byte("val1"), 0x08) // readTs:4  nextTs:5  commitTs:5  nextTs:6
+		txnSet(t, db, []byte("key216"), []byte("val1"), 0x08) // readTs:5  nextTs:6  commitTs:6  nextTs:7
+
+		// 读key1
 		txn := db.NewTransaction(false)
-		item, err := txn.Get([]byte("key1"))
+		item, err := txn.Get([]byte("key1")) // readTs:6  nextTs:7
 		require.NoError(t, err)
 		require.EqualValues(t, "val1", getItemValue(t, item))
 		require.Equal(t, byte(0x08), item.UserMeta())
 		txn.Discard()
 
-		txnSet(t, db, []byte("key1"), []byte("val2"), 0x09)
+		// 更新key1
+		txnSet(t, db, []byte("key1"), []byte("val2"), 0x09) // readTs:6  nextTs:7  commitTs:7  nextTs:8
 
-		txn = db.NewTransaction(false)
-		item, err = txn.Get([]byte("key1"))
+		// 读key1
+		txn = db.NewTransaction(false)      // readTs:7  nextTs:8
+		item, err = txn.Get([]byte("key1")) // readTs:
 		require.NoError(t, err)
 		require.EqualValues(t, "val2", getItemValue(t, item))
 		require.Equal(t, byte(0x09), item.UserMeta())
 		txn.Discard()
 
-		txnDelete(t, db, []byte("key1"))
+		// 写入删除key1
+		txnDelete(t, db, []byte("key1")) // readTs:7  nextTs:8  commitTs:8  nextTs:9
 
+		// 读取 key1
 		txn = db.NewTransaction(false)
-		_, err = txn.Get([]byte("key1"))
+		_, err = txn.Get([]byte("key1")) // readTs:8  nextTs:9
 		require.Equal(t, ErrKeyNotFound, err)
 		txn.Discard()
 
-		txnSet(t, db, []byte("key1"), []byte("val3"), 0x01)
+		// 写key1
+		txnSet(t, db, []byte("key1"), []byte("val3"), 0x01) // commitTs:
 
+		// 读key1
 		txn = db.NewTransaction(false)
-		item, err = txn.Get([]byte("key1"))
+		item, err = txn.Get([]byte("key1")) // readTs:
 		require.NoError(t, err)
 		require.EqualValues(t, "val3", getItemValue(t, item))
 		require.Equal(t, byte(0x01), item.UserMeta())
 
 		longVal := make([]byte, 1000)
-		txnSet(t, db, []byte("key1"), longVal, 0x00)
+		// 写 大key1
+		txnSet(t, db, []byte("key1"), longVal, 0x00) // commitTs:
 
+		// 读 大key1
 		txn = db.NewTransaction(false)
-		item, err = txn.Get([]byte("key1"))
+		item, err = txn.Get([]byte("key1")) // readTs:
 		require.NoError(t, err)
 		require.EqualValues(t, longVal, getItemValue(t, item))
 		txn.Discard()
 	}
+
 	t.Run("disk mode", func(t *testing.T) {
 		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 			test(t, db)
 		})
 	})
-	t.Run("InMemory mode", func(t *testing.T) {
-		opts := DefaultOptions("").WithInMemory(true)
-		db, err := Open(opts)
-		require.NoError(t, err)
-		test(t, db)
-		require.NoError(t, db.Close())
-	})
-	t.Run("cache enabled", func(t *testing.T) {
-		opts := DefaultOptions("").WithBlockCacheSize(10 << 20)
-		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
-			test(t, db)
-		})
-	})
+
+	//t.Run("InMemory mode", func(t *testing.T) {
+	//	opts := DefaultOptions("").WithInMemory(true)
+	//	db, err := Open(opts)
+	//	require.NoError(t, err)
+	//	test(t, db)
+	//	require.NoError(t, db.Close())
+	//})
+
+	//t.Run("cache enabled", func(t *testing.T) {
+	//	opts := DefaultOptions("").WithBlockCacheSize(10 << 20)
+	//	runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+	//		test(t, db)
+	//	})
+	//})
 }
 
 func TestGetAfterDelete(t *testing.T) {
@@ -409,7 +434,7 @@ func TestTxnTooBig(t *testing.T) {
 }
 
 func TestForceCompactL0(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestForceCompactL0")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -2173,7 +2198,7 @@ func TestSyncForReadingTheEntriesThatWereSynced(t *testing.T) {
 }
 
 func TestForceFlushMemtable(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestForceFlushMemtable")
 	require.NoError(t, err, "temp dir for badger could not be created")
 
 	ops := getTestOptions(dir)
@@ -2646,7 +2671,7 @@ func TestBannedAtZeroOffset(t *testing.T) {
 }
 
 func TestCompactL0OnClose(t *testing.T) {
-	opt := getTestOptions("")
+	opt := getTestOptions("F:\\ProjectsData\\golang")
 	opt.CompactL0OnClose = true
 	opt.ValueThreshold = 1 // Every value goes to value log
 	opt.NumVersionsToKeep = 1

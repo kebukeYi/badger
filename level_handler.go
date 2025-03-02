@@ -200,11 +200,9 @@ func (s *levelHandler) tryAddLevel0Table(t *table.Table) bool {
 	if len(s.tables) >= s.db.opt.NumLevelZeroTablesStall {
 		return false
 	}
-
 	s.tables = append(s.tables, t)
 	t.IncrRef()
 	s.addSize(t)
-
 	return true
 }
 
@@ -242,7 +240,7 @@ func (s *levelHandler) getTableForKey(key []byte) ([]*table.Table, func() error)
 	s.RLock()
 	defer s.RUnlock()
 
-	if s.level == 0 {
+	if s.level == 0 { // 需要全部 table 参与;
 		// For level 0, we need to check every table. Remember to make a copy as s.tables may change
 		// once we exit this function, and we don't want to lock s.tables while seeking in tables.
 		// CAUTION: Reverse the tables.
@@ -260,8 +258,11 @@ func (s *levelHandler) getTableForKey(key []byte) ([]*table.Table, func() error)
 			return nil
 		}
 	}
+
 	// For level >= 1, we can do a binary search as key range does not overlap.
 	idx := sort.Search(len(s.tables), func(i int) bool {
+		// 1.原生key的比较
+		// 2.比较版本
 		return y.CompareKeys(s.tables[i].Biggest(), key) >= 0
 	})
 	if idx >= len(s.tables) {
@@ -275,13 +276,16 @@ func (s *levelHandler) getTableForKey(key []byte) ([]*table.Table, func() error)
 
 // get returns value for a given key or the key after that. If not found, return nil.
 func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
+	// l0: 返回多个 table;
+	// lx: 返回一个 table;
 	tables, decr := s.getTableForKey(key)
 	keyNoTs := y.ParseKey(key)
-
 	hash := y.Hash(keyNoTs)
 	var maxVs y.ValueStruct
 	for _, th := range tables {
+		// bloom 过滤器进行提前判断;
 		if th.DoesNotHave(hash) {
+			// 当前 table 不存在, 则下一个 table;
 			y.NumLSMBloomHitsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
 			continue
 		}
@@ -290,17 +294,21 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 		defer it.Close()
 
 		y.NumLSMGetsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
+		// 默认 opt:0; 查找; 此时查找的是key;
 		it.Seek(key)
 		if !it.Valid() {
 			continue
 		}
+		// 忽略时间戳的比较key;
 		if y.SameKey(key, it.Key()) {
-			if version := y.ParseTs(it.Key()); maxVs.Version < version {
+			// 假如 .sst 中的版本 大于当前 maxVs 的版本, 则更新 maxVs,只要 最大版本的;
+			if itrVersion := y.ParseTs(it.Key()); maxVs.Version < itrVersion {
 				maxVs = it.ValueCopy()
-				maxVs.Version = version
+				maxVs.Version = itrVersion
 			}
 		}
-	}
+		// 继续下一个 table;
+	} // for tables
 	return maxVs, decr()
 }
 

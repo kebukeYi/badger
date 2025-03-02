@@ -74,11 +74,13 @@ type node struct {
 }
 
 type Skiplist struct {
-	height  atomic.Int32 // Current height. 1 <= height <= kMaxHeight. CAS.
-	head    *node
-	ref     atomic.Int32
-	arena   *Arena
-	OnClose func()
+	height    atomic.Int32 // Current height. 1 <= height <= kMaxHeight. CAS.
+	head      *node
+	ref       atomic.Int32
+	entryNums uint64
+	entries   map[string]struct{}
+	arena     *Arena
+	OnClose   func()
 }
 
 // IncrRef increases the refcount
@@ -129,7 +131,7 @@ func decodeValue(value uint64) (valOffset uint32, valSize uint32) {
 func NewSkiplist(arenaSize int64) *Skiplist {
 	arena := newArena(arenaSize)
 	head := newNode(arena, nil, y.ValueStruct{}, maxHeight)
-	s := &Skiplist{head: head, arena: arena}
+	s := &Skiplist{head: head, arena: arena, entries: make(map[string]struct{})}
 	s.height.Store(1)
 	s.ref.Store(1)
 	return s
@@ -183,7 +185,7 @@ func (s *Skiplist) getNext(nd *node, height int) *node {
 // If less=false, it finds leftmost node such that node.key > key (if allowEqual=false) or
 // node.key >= key (if allowEqual=true).
 // Returns the node found. The bool returned is true if the node has key equal to given key.
-func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
+func (s *Skiplist) findNear(userKey []byte, less bool, allowEqual bool) (*node, bool) {
 	x := s.head
 	level := int(s.getHeight() - 1)
 	for {
@@ -208,7 +210,12 @@ func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 		}
 
 		nextKey := next.key(s.arena)
-		cmp := y.CompareKeys(key, nextKey)
+
+		// key: key:Max-ReadTs
+		// 1.原生key比较
+		// 2.版本比较
+		// 结果: 原生key相同,但是版本不一致,也会返回出去;
+		cmp := y.CompareKeys(userKey, nextKey)
 		if cmp > 0 {
 			// x.key < next.key < key. We can continue to move right.
 			x = next
@@ -223,6 +230,8 @@ func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 				// We want >, so go to base level to grab the next bigger note.
 				return s.getNext(next, 0), false
 			}
+			// less =true; 说明是寻找 小于key的node的; 现在是 next == node;
+			// 尽管当前 x < key, 但是或许不是最接近的, 因此还是去0层查询为好;
 			// We want <. If not base level, we should go closer in the next level.
 			if level > 0 {
 				level--
@@ -293,7 +302,7 @@ func (s *Skiplist) Put(key []byte, v y.ValueStruct) {
 	for i := int(listHeight) - 1; i >= 0; i-- {
 		// Use higher level to speed up for current level.
 		prev[i], next[i] = s.findSpliceForLevel(key, prev[i+1], i)
-		if prev[i] == next[i] {
+		if prev[i] == next[i] { // 相同则更新逻辑
 			prev[i].setValue(s.arena, v)
 			return
 		}
@@ -329,6 +338,10 @@ func (s *Skiplist) Put(key []byte, v y.ValueStruct) {
 			nextOffset := s.arena.getNodeOffset(next[i])
 			x.tower[i].Store(nextOffset)
 			if prev[i].casNextOffset(i, nextOffset, s.arena.getNodeOffset(x)) {
+				if i == 0 {
+					atomic.AddUint64(&s.entryNums, 1)
+					s.entries[string(key)] = struct{}{}
+				}
 				// Managed to insert x between prev[i] and next[i]. Go to the next level.
 				break
 			}
@@ -373,19 +386,23 @@ func (s *Skiplist) findLast() *node {
 
 // Get gets the value associated with the key. It returns a valid value if it finds equal or earlier
 // version of the same key.
-func (s *Skiplist) Get(key []byte) y.ValueStruct {
-	n, _ := s.findNear(key, false, true) // findGreaterOrEqual.
-	if n == nil {
+func (s *Skiplist) Get(keyMaxReadTs []byte) y.ValueStruct {
+	// less: 不小于当前值
+	n, _ := s.findNear(keyMaxReadTs, false, true) // findGreaterOrEqual.
+	if n == nil {                                 // 此时返回的 数据, 原生key相同, 但是版本可能不相同;
 		return y.ValueStruct{}
 	}
 
 	nextKey := s.arena.getKey(n.keyOffset, n.keySize)
-	if !y.SameKey(key, nextKey) {
+	// 注意: 此时的 nextKey, 可能和原生key相同,但是版本不同;
+	// 仅仅比较原生key是否相同;
+	if !y.SameKey(keyMaxReadTs, nextKey) {
 		return y.ValueStruct{}
 	}
 
 	valOffset, valSize := n.getValueOffset()
 	vs := s.arena.getVal(valOffset, valSize)
+	// 解析出 正常递增的版本号;
 	vs.Version = y.ParseTs(nextKey)
 	return vs
 }

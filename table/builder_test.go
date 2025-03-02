@@ -285,5 +285,4 @@ func TestEmptyBuilder(t *testing.T) {
 	b := NewTableBuilder(opts)
 	defer b.Close()
 	require.Equal(t, []byte{}, b.Finish())
-
 }

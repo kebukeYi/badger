@@ -51,7 +51,6 @@ func InitDiscardStats(opt Options) (*discardStats, error) {
 	if err == z.NewFile {
 		// We don't need to zero out the entire 1MB.
 		lf.zeroOut()
-
 	} else if err != nil {
 		return nil, y.Wrapf(err, "while opening file: %s\n", discardFname)
 	}
@@ -111,6 +110,7 @@ func (lf *discardStats) Update(fidu uint32, discard int64) int64 {
 	idx := sort.Search(lf.nextEmptySlot, func(slot int) bool {
 		return lf.get(slot*16) >= fid
 	})
+
 	if idx < lf.nextEmptySlot && lf.get(idx*16) == fid {
 		off := idx*16 + 8
 		curDisc := lf.get(off)
@@ -124,6 +124,7 @@ func (lf *discardStats) Update(fidu uint32, discard int64) int64 {
 		lf.set(off, curDisc+uint64(discard))
 		return int64(curDisc + uint64(discard))
 	}
+
 	if discard <= 0 {
 		// No need to add a new entry.
 		return 0

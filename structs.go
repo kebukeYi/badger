@@ -123,11 +123,13 @@ func (h *header) DecodeFrom(reader *hashReader) (int, error) {
 		return 0, err
 	}
 	h.klen = uint32(klen)
+
 	vlen, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return 0, err
 	}
 	h.vlen = uint32(vlen)
+
 	h.expiresAt, err = binary.ReadUvarint(reader)
 	if err != nil {
 		return 0, err
@@ -159,12 +161,14 @@ func (e *Entry) estimateSizeAndSetThreshold(threshold int64) int64 {
 	if e.valThreshold == 0 {
 		e.valThreshold = threshold
 	}
-	k := int64(len(e.Key))
-	v := int64(len(e.Value))
-	if v < e.valThreshold {
-		return k + v + 2 // Meta, UserMeta
+	kLen := int64(len(e.Key))
+	vLen := int64(len(e.Value))
+	// 写入 LSM 中的大小;
+	if vLen < e.valThreshold {
+		return kLen + vLen + 2 // Meta, UserMeta
 	}
-	return k + 12 + 2 // 12 for ValuePointer, 2 for metas.
+	// 先写入 vlog中,然后再写入 LSM 中;
+	return kLen + 12 + 2 // 12 for ValuePointer, 2 for metas.
 }
 
 func (e *Entry) skipVlogAndSetThreshold(threshold int64) bool {

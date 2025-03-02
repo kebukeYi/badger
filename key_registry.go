@@ -86,6 +86,7 @@ func OpenKeyRegistry(opt KeyRegistryOptions) (*KeyRegistry, error) {
 	if opt.InMemory {
 		return newKeyRegistry(opt), nil
 	}
+
 	path := filepath.Join(opt.Dir, KeyRegistryFileName)
 	var flags y.Flags
 	if opt.ReadOnly {
@@ -310,8 +311,8 @@ func (kr *KeyRegistry) DataKey(id uint64) (*pb.DataKey, error) {
 	return dk, nil
 }
 
-// LatestDataKey will give you the latest generated datakey based on the rotation
-// period. If the last generated datakey lifetime exceeds the rotation period.
+// LatestDataKey will give you the latest generated datakey based on the rotation period.
+// If the last generated datakey lifetime exceeds the rotation period.
 // It'll create new datakey.
 func (kr *KeyRegistry) LatestDataKey() (*pb.DataKey, error) {
 	if len(kr.opt.EncryptionKey) == 0 {

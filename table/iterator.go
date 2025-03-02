@@ -62,7 +62,7 @@ func (itr *blockIterator) setBlock(b *Block) {
 
 // setIdx sets the iterator to the entry at index i and set it's key and value.
 func (itr *blockIterator) setIdx(i int) {
-	itr.idx = i
+	itr.idx = i // 在调用prev()方法时,有奇效!!!
 	if i >= len(itr.entryOffsets) || i < 0 {
 		itr.err = io.EOF
 		return
@@ -74,7 +74,7 @@ func (itr *blockIterator) setIdx(i int) {
 	if len(itr.baseKey) == 0 {
 		var baseHeader header
 		baseHeader.Decode(itr.data)
-		itr.baseKey = itr.data[headerSize : headerSize+baseHeader.diff]
+		itr.baseKey = itr.data[headerSize : headerSize+baseHeader.diff] // key: key:max-commitTs
 	}
 
 	var endOffset int
@@ -86,6 +86,7 @@ func (itr *blockIterator) setIdx(i int) {
 		// EndOffset of the current entry is the start offset of the next entry.
 		endOffset = int(itr.entryOffsets[itr.idx+1])
 	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			var debugBuf bytes.Buffer
@@ -110,7 +111,7 @@ func (itr *blockIterator) setIdx(i int) {
 	itr.prevOverlap = h.overlap
 	valueOff := headerSize + h.diff
 	diffKey := entryData[headerSize:valueOff]
-	itr.key = append(itr.key[:h.overlap], diffKey...)
+	itr.key = append(itr.key[:h.overlap], diffKey...) // key: key:max-commitTs
 	itr.val = entryData[valueOff:]
 }
 
@@ -147,9 +148,10 @@ func (itr *blockIterator) seek(key []byte, whence int) {
 		// If idx is less than start index then just return false.
 		if idx < startIndex {
 			return false
-		}
-		itr.setIdx(idx)
-		return y.CompareKeys(itr.key, key) >= 0
+		} // 当 当前block 没有找到 bKey > key 时, 此时的 blockKey会指在当前maxBlockKey上;
+		itr.setIdx(idx) // itr.key > key; 直接去寻找大于等于当前key;
+		compareKeys := y.CompareKeys(itr.key, key)
+		return compareKeys >= 0
 	})
 	itr.setIdx(foundEntryIdx)
 }
@@ -273,11 +275,16 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	}
 
 	var ko fb.BlockOffset
+	// 二分法在当前 block[] 进行搜索;
 	idx := sort.Search(itr.t.offsetsLength(), func(idx int) bool {
 		// Offsets should never return false since we're iterating within the OffsetsLength.
 		y.AssertTrue(itr.t.offsets(&ko, idx))
-		return y.CompareKeys(ko.KeyBytes(), key) > 0
+		// block的最小key > key
+		blockMinKey := ko.KeyBytes()
+		compareKeys := y.CompareKeys(blockMinKey, key)
+		return compareKeys > 0
 	})
+	// why? 已经确定找不到了,但是仍然需要返回一个 大于当前key的值;
 	if idx == 0 {
 		// The smallest key in our table is already strictly > key. We can return that.
 		// This is like a SeekToFirst.
@@ -292,13 +299,16 @@ func (itr *Iterator) seekFrom(key []byte, whence int) {
 	//    element of block[idx].
 	// 2) Some element in block[idx-1] is >= key. We should go to that element.
 	itr.seekHelper(idx-1, key)
+	// 在 block[idx-1] 没有找到;
 	if itr.err == io.EOF {
 		// Case 1. Need to visit block[idx].
-		if idx == itr.t.offsetsLength() {
+		// 如果此时的 idx 等于 len() ,那么idx-1 就是最后一个block;
+		if idx == itr.t.offsetsLength() { //最后一个都还是没有找到的话, 那就没有了;
 			// If idx == len(itr.t.blockIndex), then input key is greater than ANY element of table.
 			// There's nothing we can do. Valid() should return false as we seek to end of table.
 			return
 		}
+		// todo 看不懂;
 		// Since block[idx].smallest is > key. This is essentially a block[idx].SeekToFirst.
 		itr.seekHelper(idx, key)
 	}
@@ -313,8 +323,10 @@ func (itr *Iterator) seek(key []byte) {
 // seekForPrev will reset iterator and seek to <= key.
 func (itr *Iterator) seekForPrev(key []byte) {
 	// TODO: Optimize this. We shouldn't have to take a Prev step.
-	itr.seekFrom(key, origin)
-	if !bytes.Equal(itr.Key(), key) {
+	itr.seekFrom(key, origin) // 先去尝试是否找到精确相同的;
+	// 然后再比较是否精准找到,没有精确找到,就返回前一个值;
+	currKey := itr.Key()
+	if !bytes.Equal(currKey, key) {
 		itr.prev()
 	}
 }
@@ -372,9 +384,10 @@ func (itr *Iterator) prev() {
 	}
 
 	itr.bi.prev()
+	// 当前 block无效也无非就是到了 block 的第一个值;
 	if !itr.bi.Valid() {
 		itr.bpos--
-		itr.bi.data = nil
+		itr.bi.data = nil // 换前一个 block上;
 		itr.prev()
 		return
 	}
@@ -421,8 +434,10 @@ func (itr *Iterator) Rewind() {
 // Seek follows the y.Iterator interface
 func (itr *Iterator) Seek(key []byte) {
 	if itr.opt&REVERSED == 0 {
+		// 精准找 || 找到这个值的后一个值;
 		itr.seek(key)
 	} else {
+		// 精准找 || 找到这个值的前一个值;
 		itr.seekForPrev(key)
 	}
 }
@@ -504,15 +519,23 @@ func (s *ConcatIterator) Value() y.ValueStruct {
 // Seek brings us to element >= key if reversed is false. Otherwise, <= key.
 func (s *ConcatIterator) Seek(key []byte) {
 	var idx int
-	if s.options&REVERSED == 0 {
+	if s.options&REVERSED == 0 { // 升序
 		idx = sort.Search(len(s.tables), func(i int) bool {
-			return y.CompareKeys(s.tables[i].Biggest(), key) >= 0
+			biggest := s.tables[i].Biggest()
+			cmp := y.CompareKeys(biggest, key)
+			return cmp >= 0
 		})
-	} else {
+	} else { // 降序
 		n := len(s.tables)
-		idx = n - 1 - sort.Search(n, func(i int) bool {
-			return y.CompareKeys(s.tables[n-1-i].Smallest(), key) <= 0
+		index := n - 1
+		idx = sort.Search(n, func(i int) bool {
+			smallest := s.tables[index-i].Smallest()
+			cmp := y.CompareKeys(smallest, key)
+			return cmp <= 0
 		})
+		// [A-D], [E-G], [H-O]
+		// 正序:
+		idx = index - idx
 	}
 	if idx >= len(s.tables) || idx < 0 {
 		s.setIdx(-1)

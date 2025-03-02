@@ -96,18 +96,22 @@ func (n *node) seek(key []byte) {
 }
 
 func (mi *MergeIterator) fix() {
-	if !mi.bigger().valid {
+	if !mi.otherNode().valid {
 		return
 	}
 	if !mi.small.valid {
 		mi.swapSmall()
 		return
 	}
-	cmp := y.CompareKeys(mi.small.key, mi.bigger().key)
+	//  left, right 两边比较key, 包含比较版本号;
+	cmp := y.CompareKeys(mi.small.key, mi.otherNode().key)
 	switch {
+	// 数据+版本号,双方两者都相同, 怎么办,肯定要丢弃一个, 但是两个都相同,丢弃哪一个都行吧?
 	case cmp == 0: // Both the keys are equal.
 		// In case of same keys, move the right iterator ahead.
-		mi.right.next()
+		mi.right.next() // 好,选择,选择right的一边; 那就剩下一个key了;
+		// 1. mi.right 是small, 那就交换指针, 因为right已经走了一个,现在需要left的;
+		// 2. mi.right 不是small, 那就不用交换; right走了一个, small指向的也是left;
 		if &mi.right == mi.small {
 			mi.swapSmall()
 		}
@@ -130,7 +134,7 @@ func (mi *MergeIterator) fix() {
 	}
 }
 
-func (mi *MergeIterator) bigger() *node {
+func (mi *MergeIterator) otherNode() *node {
 	if mi.small == &mi.left {
 		return &mi.right
 	}
@@ -151,6 +155,7 @@ func (mi *MergeIterator) swapSmall() {
 // Next returns the next element. If it is the same as the current key, ignore it.
 func (mi *MergeIterator) Next() {
 	for mi.Valid() {
+		// 什么情况下会相同呢?
 		if !bytes.Equal(mi.small.key, mi.curKey) {
 			break
 		}

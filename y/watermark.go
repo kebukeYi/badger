@@ -20,6 +20,7 @@ import (
 	"container/heap"
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/dgraph-io/ristretto/v2/z"
 )
@@ -45,9 +46,12 @@ type mark struct {
 	// Either this is an (index, waiter) pair or (index, done) or (indices, done).
 	index   uint64
 	waiter  chan struct{}
-	indices []uint64
-	done    bool // Set to true if the index is done.
+	indices []uint64 // 大量index
+	done    bool     // Set to true if the index is done.
 }
+
+// 这段代码的核心是通过 WaterMark 结构维护一个“水位线”，用于跟踪索引的完成状态，并通知等待的协程。
+// 它的设计高效且线程安全，适用于高并发的任务调度和流处理场景。通过最小堆和原子操作，它能够高效地管理索引状态并通知等待的协程;
 
 // WaterMark is used to keep track of the minimum un-finished index.  Typically, an index k becomes
 // finished or "done" according to a WaterMark once Done(k) has been called
@@ -96,6 +100,7 @@ func (w *WaterMark) DoneMany(indices []uint64) {
 
 // DoneUntil returns the maximum index that has the property that all indices
 // less than or equal to it are done.
+// 该索引具有所有小于或等于它的索引都已完成的属性; 应该是 小于 lastIndex;
 func (w *WaterMark) DoneUntil() uint64 {
 	return w.doneUntil.Load()
 }
@@ -113,9 +118,11 @@ func (w *WaterMark) LastIndex() uint64 {
 
 // WaitForMark waits until the given index is marked as done.
 func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
-	if w.DoneUntil() >= index {
+	doneUntil := w.DoneUntil()
+	if doneUntil >= index {
 		return nil
 	}
+
 	waitCh := make(chan struct{})
 	w.markCh <- mark{index: index, waiter: waitCh}
 
@@ -130,8 +137,9 @@ func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
 // process is used to process the Mark channel. This is not thread-safe,
 // so only run one goroutine for process. One is sufficient, because
 // all goroutine ops use purely memory and cpu.
-// Each index has to emit atleast one begin watermark in serial order otherwise waiters
-// can get blocked idefinitely. Example: We had an watermark at 100 and a waiter at 101,
+// Each index has to emit at least one begin watermark in serial order otherwise waiters
+// can get blocked indefinitely. 每个索引必须按顺序发出至少一个起始水印，否则会无限期地阻塞;
+// Example: We had an watermark at 100 and a waiter at 101,
 // if no watermark is emitted at index 101 then waiter would get stuck indefinitely as it
 // can't decide whether the task at 101 has decided not to emit watermark or it didn't get
 // scheduled yet.
@@ -140,12 +148,15 @@ func (w *WaterMark) process(closer *z.Closer) {
 
 	var indices uint64Heap
 	// pending maps raft proposal index to the number of pending mutations for this proposal.
+	// < index, dones >
 	pending := make(map[uint64]int)
+	// < index, chans >等待此 index 结束的协程;
 	waiters := make(map[uint64][]chan struct{})
 
 	heap.Init(&indices)
 
 	processOne := func(index uint64, done bool) {
+		time.Sleep(3 * time.Second)
 		// If not already done, then set. Otherwise, don't undo a done entry.
 		prev, present := pending[index]
 		if !present {
@@ -153,9 +164,10 @@ func (w *WaterMark) process(closer *z.Closer) {
 		}
 
 		delta := 1
-		if done {
+		if done { // 用户传来的 index, 是否结束的标志;
 			delta = -1
 		}
+		// 很多次 累加的结果;
 		pending[index] = prev + delta
 
 		// Update mark by going through all indices in order; and checking if they have
@@ -171,8 +183,10 @@ func (w *WaterMark) process(closer *z.Closer) {
 		for len(indices) > 0 {
 			min := indices[0]
 			if done := pending[min]; done > 0 {
+				// 说明当前最小值,还没结束, 后续的需要等待;
 				break // len(indices) will be > 0.
 			}
+			// done <= 0; 该结束了;
 			// Even if done is called multiple times causing it to become
 			// negative, we should still pop the index.
 			heap.Pop(&indices)
@@ -182,9 +196,12 @@ func (w *WaterMark) process(closer *z.Closer) {
 		}
 
 		if until != doneUntil {
-			AssertTrue(w.doneUntil.CompareAndSwap(doneUntil, until))
+			// 原子更新一下,最新doneUtil值;
+			compareAndSwap := w.doneUntil.CompareAndSwap(doneUntil, until)
+			AssertTrue(compareAndSwap)
 		}
 
+		// 有选择的 进行通知删除操作;
 		notifyAndRemove := func(idx uint64, toNotify []chan struct{}) {
 			for _, ch := range toNotify {
 				close(ch)
@@ -192,42 +209,54 @@ func (w *WaterMark) process(closer *z.Closer) {
 			delete(waiters, idx) // Release the memory back.
 		}
 
-		if until-doneUntil <= uint64(len(waiters)) {
+		// 剩余等待的 >= 刚刚处理的几个 index;
+		//  doneUntil,,,,,,,,,,,,,,,,,until
+		//           ,,,waiters,,,,,,,,,,,,,,
+		//           ,,,waiters,,
+		//                       ,,,waiters,,
+		if uint64(len(waiters)) >= until-doneUntil {
 			// Issue #908 showed that if doneUntil is close to 2^60, while until is zero, this loop
 			// can hog up CPU just iterating over integers creating a busy-wait loop. So, only do
 			// this path if until - doneUntil is less than the number of waiters.
+			// 先少量少量的 通知处理;
 			for idx := doneUntil + 1; idx <= until; idx++ {
-				if toNotify, ok := waiters[idx]; ok {
-					notifyAndRemove(idx, toNotify)
+				if toNotifies, ok := waiters[idx]; ok {
+					notifyAndRemove(idx, toNotifies)
 				}
 			}
 		} else {
-			for idx, toNotify := range waiters {
+			// 剩余等待的 < 刚刚处理的几个 index;
+			for idx, toNotifies := range waiters {
 				if idx <= until {
-					notifyAndRemove(idx, toNotify)
+					notifyAndRemove(idx, toNotifies)
 				}
 			}
 		} // end of notifying waiters.
-	}
+
+	} // end of processOne
 
 	for {
 		select {
 		case <-closer.HasBeenClosed():
 			return
 		case mark := <-w.markCh:
+			// 说明外界有等待的;需要保存下来;
 			if mark.waiter != nil {
 				doneUntil := w.doneUntil.Load()
 				if doneUntil >= mark.index {
 					close(mark.waiter)
 				} else {
+					// 是否存在 相同 等待的;
 					ws, ok := waiters[mark.index]
 					if !ok {
 						waiters[mark.index] = []chan struct{}{mark.waiter}
 					} else {
+						// 可能存在 很多 等待同一个 index 的协程;
 						waiters[mark.index] = append(ws, mark.waiter)
 					}
 				}
 			} else {
+				//
 				// it is possible that mark.index is zero. We need to handle that case as well.
 				if mark.index > 0 || (mark.index == 0 && len(mark.indices) == 0) {
 					processOne(mark.index, mark.done)
@@ -238,4 +267,5 @@ func (w *WaterMark) process(closer *z.Closer) {
 			}
 		}
 	}
+
 }

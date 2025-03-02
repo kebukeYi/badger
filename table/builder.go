@@ -140,8 +140,8 @@ func NewTableBuilder(opts Options) *Builder {
 	}
 	b.opts.tableCapacity = uint64(float64(b.opts.TableSize) * 0.95)
 
-	// If encryption or compression is not enabled, do not start compression/encryption goroutines
-	// and write directly to the buffer.
+	// If encryption or compression is not enabled,
+	// do not start compression/encryption goroutines and write directly to the buffer.
 	if b.opts.Compression == options.None && b.opts.DataKey == nil {
 		return b
 	}
@@ -218,9 +218,12 @@ func (b *Builder) keyDiff(newKey []byte) []byte {
 }
 
 func (b *Builder) addHelper(key []byte, v y.ValueStruct, vpLen uint32) {
+	// 布隆过滤器中, 添加的是 原生key;
 	b.keyHashes = append(b.keyHashes, y.Hash(y.ParseKey(key)))
 
+	// 提取出真实的递增 commitTs 作为 version;
 	if version := y.ParseTs(key); version > b.maxVersion {
+		// 保存当前 builder 的最大version;
 		b.maxVersion = version
 	}
 
@@ -229,6 +232,7 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct, vpLen uint32) {
 	if len(b.curBlock.baseKey) == 0 {
 		// Make a copy. Builder should not keep references. Otherwise, caller has to be very careful
 		// and will have to make copies of keys every time they add to builder, which is even worse.
+		// key: key:max-commitTS, version: commitTs;
 		b.curBlock.baseKey = append(b.curBlock.baseKey[:0], key...)
 		diffKey = key
 	} else {
@@ -345,17 +349,20 @@ func (b *Builder) Add(key []byte, value y.ValueStruct, valueLen uint32) {
 }
 
 func (b *Builder) addInternal(key []byte, value y.ValueStruct, valueLen uint32, isStale bool) {
+	// 预估当前 block 是否能放下数据;
 	if b.shouldFinishBlock(key, value) {
 		if isStale {
 			// This key will be added to tableIndex and it is stale.
 			b.staleDataSize += len(key) + 4 /* len */ + 4 /* offset */
 		}
+		// 结束掉当前block;
 		b.finishBlock()
 		// Create a new block and start writing.
 		b.curBlock = &bblock{
 			data: b.alloc.Allocate(b.opts.BlockSize + padding),
 		}
 	}
+	// 直接添加到block中;
 	b.addHelper(key, value, valueLen)
 }
 
@@ -398,6 +405,7 @@ The table structure looks like
 */
 // In case the data is encrypted, the "IV" is added to the end of the index.
 func (b *Builder) Finish() []byte {
+	// 构建 table的数据;
 	bd := b.Done()
 	buf := make([]byte, bd.Size)
 	written := bd.Copy(buf)
@@ -585,9 +593,8 @@ func (b *Builder) writeBlockOffsets(builder *fbs.Builder) ([]fbs.UOffsetT, uint3
 
 // writeBlockOffset writes the given key,offset,len triple to the indexBuilder.
 // It returns the offset of the newly written blockoffset.
-func (b *Builder) writeBlockOffset(
-	builder *fbs.Builder, bl *bblock, startOffset uint32) fbs.UOffsetT {
-	// Write the key to the buffer.
+func (b *Builder) writeBlockOffset(builder *fbs.Builder, bl *bblock, startOffset uint32) fbs.UOffsetT {
+	// Write the base key to the buffer.
 	k := builder.CreateByteVector(bl.baseKey)
 
 	// Build the blockOffset.

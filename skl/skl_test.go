@@ -84,6 +84,38 @@ func TestEmpty(t *testing.T) {
 	require.False(t, l.valid()) // Check the reference counting.
 }
 
+func TestReadTs(t *testing.T) {
+	l := NewSkiplist(arenaSize)
+	val1 := newValue(42)
+	val2 := newValue(52)
+	val3 := newValue(62)
+	val4 := newValue(72)
+	l.Put(y.KeyWithTs([]byte("key1"), 10), y.ValueStruct{Value: val1, Meta: 56, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key0"), 10), y.ValueStruct{Value: val1, Meta: 56, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key11"), 10), y.ValueStruct{Value: val1, Meta: 56, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key20"), 10), y.ValueStruct{Value: val2, Meta: 57, UserMeta: 0})
+
+	l.Put(y.KeyWithTs([]byte("key22"), 10), y.ValueStruct{Value: val2, Meta: 57, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key23"), 10), y.ValueStruct{Value: val2, Meta: 57, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key255"), 10), y.ValueStruct{Value: val2, Meta: 57, UserMeta: 0})
+
+	// 低版本
+	//l.Put(y.KeyWithTs([]byte("key3"), 7), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+	//l.Put(y.KeyWithTs([]byte("key3"), 8), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+	// 现版本
+	//l.Put(y.KeyWithTs([]byte("key3"), 10), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+	// 高版本
+	l.Put(y.KeyWithTs([]byte("key3"), 14), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key3"), 16), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+
+	l.Put(y.KeyWithTs([]byte("key99"), 10), y.ValueStruct{Value: val4, Meta: 57, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key999"), 10), y.ValueStruct{Value: val4, Meta: 57, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key994343"), 10), y.ValueStruct{Value: val4, Meta: 57, UserMeta: 0})
+
+	v := l.Get(y.KeyWithTs([]byte("key3"), 10))
+	fmt.Sprintf("%v", v)
+}
+
 // TestBasic tests single-threaded inserts and updates and gets.
 func TestBasic(t *testing.T) {
 	l := NewSkiplist(arenaSize)
@@ -95,9 +127,9 @@ func TestBasic(t *testing.T) {
 
 	// Try inserting values.
 	// Somehow require.Nil doesn't work when checking for unsafe.Pointer(nil).
-	l.Put(y.KeyWithTs([]byte("key1"), 0), y.ValueStruct{Value: val1, Meta: 55, UserMeta: 0})
-	l.Put(y.KeyWithTs([]byte("key2"), 2), y.ValueStruct{Value: val2, Meta: 56, UserMeta: 0})
-	l.Put(y.KeyWithTs([]byte("key3"), 0), y.ValueStruct{Value: val3, Meta: 57, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key1"), 0), y.ValueStruct{Value: val1, Meta: 56, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key3"), 0), y.ValueStruct{Value: val3, Meta: 55, UserMeta: 0})
+	l.Put(y.KeyWithTs([]byte("key2"), 2), y.ValueStruct{Value: val2, Meta: 57, UserMeta: 0})
 
 	v := l.Get(y.KeyWithTs([]byte("key"), 0))
 	require.True(t, v.Value == nil)
@@ -140,8 +172,7 @@ func TestConcurrentBasic(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			l.Put(key(i),
-				y.ValueStruct{Value: newValue(i), Meta: 0, UserMeta: 0})
+			l.Put(key(i), y.ValueStruct{Value: newValue(i), Meta: 0, UserMeta: 0})
 		}(i)
 	}
 	wg.Wait()

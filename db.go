@@ -52,13 +52,14 @@ var (
 )
 
 type closers struct {
-	updateSize  *z.Closer
-	compactors  *z.Closer
-	memtable    *z.Closer
-	writes      *z.Closer
-	valueGC     *z.Closer
+	compactors *z.Closer // 收到信号后, 立即停止合并操作;
+	memtable   *z.Closer // 收到信号后, 立即停止刷盘;
+	writes     *z.Closer // 收到信号后, 还需写完后, 返回;
+	valueGC    *z.Closer // 收到信号后, 当前vlogGC不管, 仅禁止新 vlogGC 启动;
+
 	pub         *z.Closer
 	cacheHealth *z.Closer
+	updateSize  *z.Closer
 }
 
 type lockedKeys struct {
@@ -145,6 +146,8 @@ func checkAndSetOptions(opt *Options) error {
 	if opt.InMemory && (opt.Dir != "" || opt.ValueDir != "") {
 		return errors.New("Cannot use badger in Disk-less mode with Dir or ValueDir set")
 	}
+	// 1. txn.commit()
+	// 2. vlog.rewrite()
 	opt.maxBatchSize = (15 * opt.MemTableSize) / 100
 	opt.maxBatchCount = opt.maxBatchSize / int64(skl.MaxNodeSize)
 
@@ -156,8 +159,7 @@ func checkAndSetOptions(opt *Options) error {
 
 	// We are limiting opt.ValueThreshold to maxValueThreshold for now.
 	if opt.ValueThreshold > maxValueThreshold {
-		return errors.Errorf("Invalid ValueThreshold, must be less or equal to %d",
-			maxValueThreshold)
+		return errors.Errorf("Invalid ValueThreshold, must be less or equal to %d", maxValueThreshold)
 	}
 
 	// If ValueThreshold is greater than opt.maxBatchSize, we won't be able to push any data using
@@ -167,8 +169,10 @@ func checkAndSetOptions(opt *Options) error {
 			"reduce opt.ValueThreshold or increase opt.BaseTableSize.",
 			opt.ValueThreshold, opt.maxBatchSize)
 	}
+
 	// ValueLogFileSize should be strictly LESS than 2<<30 otherwise we will
 	// overflow the uint32 when we mmap it in OpenMemtable.
+	//            1MB <=  ValueLogFileSize < 2048MB = 2GB
 	if !(opt.ValueLogFileSize < 2<<30 && opt.ValueLogFileSize >= 1<<20) {
 		return ErrValueLogSize
 	}
@@ -187,15 +191,18 @@ func checkAndSetOptions(opt *Options) error {
 
 // Open returns a new DB object.
 func Open(opt Options) (*DB, error) {
+	// 获得默认配置
 	if err := checkAndSetOptions(&opt); err != nil {
 		return nil, err
 	}
+	// 目录锁
 	var dirLockGuard, valueDirLockGuard *directoryLockGuard
 
 	// Create directories and acquire lock on it only if badger is not running in InMemory mode.
 	// We don't have any directories/files in InMemory mode so we don't need to acquire
 	// any locks on them.
 	if !opt.InMemory {
+		// 创建文件, 默认 两个目录都是一个目录下;
 		if err := createDirs(opt); err != nil {
 			return nil, err
 		}
@@ -231,7 +238,7 @@ func Open(opt Options) (*DB, error) {
 			}
 		}
 	}
-
+	// 打开 manifest文件
 	manifestFile, manifest, err := openOrCreateManifestFile(opt)
 	if err != nil {
 		return nil, err
@@ -263,6 +270,7 @@ func Open(opt Options) (*DB, error) {
 	defer func() {
 		if err != nil {
 			opt.Errorf("Received err: %v. Cleaning up...", err)
+			// 出现错误时,关闭所有任务;
 			db.cleanup()
 			db = nil
 		}
@@ -311,6 +319,7 @@ func Open(opt Options) (*DB, error) {
 		}
 	}
 
+	// 新建一个 closer, 方便通道之间的通信;
 	db.closers.cacheHealth = z.NewCloser(1)
 	go db.monitorCache(db.closers.cacheHealth)
 
@@ -331,9 +340,11 @@ func Open(opt Options) (*DB, error) {
 		return db, err
 	}
 	db.calculateSize()
+
 	db.closers.updateSize = z.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
 
+	// 更新内存表;
 	if err := db.openMemTables(db.opt); err != nil {
 		return nil, y.Wrapf(err, "while opening memtables")
 	}
@@ -353,11 +364,15 @@ func Open(opt Options) (*DB, error) {
 	db.vlog.init(db)
 
 	if !opt.ReadOnly {
+		// 默认是1个, 后台开几个协程, 就开几个closer通信;
 		db.closers.compactors = z.NewCloser(1)
+		// todo Compact
 		db.lc.startCompact(db.closers.compactors)
 
+		// 默认是1个, for{}检测, 一锤子买卖类似;
 		db.closers.memtable = z.NewCloser(1)
 		go func() {
+			// todo memoryTable.flush()
 			db.flushMemtable(db.closers.memtable) // Need levels controller to be up.
 		}()
 		// Flush them to disk asap.
@@ -369,15 +384,17 @@ func Open(opt Options) (*DB, error) {
 	db.orc.nextTxnTs = db.MaxVersion()
 	db.opt.Infof("Set nextTxnTs to %d", db.orc.nextTxnTs)
 
+	// 打开 vlog, 进行重写 vlog;
 	if err = db.vlog.open(db); err != nil {
 		return db, y.Wrapf(err, "During db.vlog.open")
 	}
 
 	// Let's advance nextTxnTs to one more than whatever we observed via
-	// replaying the logs.
+	// replaying the logs. 让我们将 nextTxnTs 提升到比我们通过重放日志观察到的多一个;
 	db.orc.txnMark.Done(db.orc.nextTxnTs)
 	// In normal mode, we must update readMark so older versions of keys can be removed during
 	// compaction when run in offline mode via the flatten tool.
+	// 在正常模式下, 我们必须更新readMark, 以便在离线模式下通过flatten工具运行时在压缩期间删除旧版本的键;
 	db.orc.readMark.Done(db.orc.nextTxnTs)
 	db.orc.incrementNextTs()
 
@@ -388,10 +405,15 @@ func Open(opt Options) (*DB, error) {
 	}
 
 	db.closers.writes = z.NewCloser(1)
+	// 一直在检测 HasBeenClosed();
+	// 1. 接收数据
+	// 2. 设置限流器,写入数据;
+	// 3. 直接返回
 	go db.doWrites(db.closers.writes)
 
 	if !db.opt.InMemory {
 		db.closers.valueGC = z.NewCloser(1)
+		// 开启一个协程, 监听关闭事件, 来禁止新 VlogGC 启动;
 		go db.vlog.waitOnGC(db.closers.valueGC)
 	}
 
@@ -482,14 +504,18 @@ func (db *DB) monitorCache(c *z.Closer) {
 	}
 }
 
-// cleanup stops all the goroutines started by badger. This is used in open to
-// cleanup goroutines in case of an error.
+// cleanup stops all the goroutines started by badger.
+// This is used in open to cleanup goroutines in case of an error.
+// todo 优雅清除数据,当 db.open() 失败时;
 func (db *DB) cleanup() {
+	// 使用 close(channel) 来发送 关闭信号, 立即停止刷盘操作,尽管还存在数据;
 	db.stopMemoryFlush()
+	// 发送 SignalAndWait(); 立即停止合并;
 	db.stopCompactions()
 
 	db.blockCache.Close()
 	db.indexCache.Close()
+
 	if db.closers.updateSize != nil {
 		db.closers.updateSize.Signal()
 	}
@@ -505,8 +531,8 @@ func (db *DB) cleanup() {
 
 	db.orc.Stop()
 
-	// Do not use vlog.Close() here. vlog.Close truncates the files. We don't
-	// want to truncate files unless the user has specified the truncate flag.
+	// Do not use vlog.Close() here. vlog.Close  will truncate the files.
+	// We don't want to truncate files unless the user has specified the truncate flag.
 }
 
 // BlockCacheMetrics returns the metrics for the underlying block cache.
@@ -541,6 +567,7 @@ func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
 }
 
+// todo 优雅关闭
 func (db *DB) close() (err error) {
 	defer db.allocPool.Release()
 
@@ -550,8 +577,11 @@ func (db *DB) close() (err error) {
 	db.blockWrites.Store(1)
 	db.isClosed.Store(1)
 
+	// 1.发送Signal()信号, 对方接收到信号后,进行收尾工作,结束后,再发送信号;
+	// 2.当前协程进行 wait(), 等待收尾工作的结果信号;
 	if !db.opt.InMemory {
 		// Stop value GC first.
+		// 仅仅禁止 新vlogGVC启动;
 		db.closers.valueGC.SignalAndWait()
 	}
 
@@ -574,7 +604,9 @@ func (db *DB) close() (err error) {
 			// Remove the memtable if empty.
 			db.mt.DecrRef()
 		} else {
-			db.opt.Debugf("Flushing memtable")
+			// 当前数据库需要关闭, 但是现在在存在一个 内存表, 我们选择赶紧刷盘;
+			// 但是存在wal文件啊, 下次重启恢复wal即可啊;
+			db.opt.Debugf("db.close() and Flushing memtable")
 			for {
 				pushedMemTable := func() bool {
 					db.lock.Lock()
@@ -582,31 +614,35 @@ func (db *DB) close() (err error) {
 					y.AssertTrue(db.mt != nil)
 					select {
 					case db.flushChan <- db.mt:
+						// 通道发送后, 还需要再保存一份;但是在消费完毕后,会从容器中删除此数据;
 						db.imm = append(db.imm, db.mt) // Flusher will attempt to remove this from s.imm.
 						db.mt = nil                    // Will segfault if we try writing!
 						db.opt.Debugf("pushed to flush chan\n")
 						return true
 					default:
 						// If we fail to push, we need to unlock and wait for a short while.
-						// The flushing operation needs to update s.imm. Otherwise, we have a
-						// deadlock.
+						// The flushing operation needs to update s.imm.
+						// Otherwise, we have a deadlock.
 						// TODO: Think about how to do this more cleanly, maybe without any locks.
+						// 此时或许还有其他不可变表也在刷盘;将当前表追加到imm中; 此时还有 flush协程也在操作这个容器;
 					}
 					return false
 				}()
 				if pushedMemTable {
 					break
 				}
+				// 刷盘失败, 继续尝试;
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}
+
 	db.stopMemoryFlush()
 	db.stopCompactions()
 
 	// Force Compact L0
 	// We don't need to care about cstatus since no parallel compaction is running.
-	if db.opt.CompactL0OnClose {
+	if db.opt.CompactL0OnClose { // 默认是 false;
 		err := db.lc.doCompact(173, compactionPriority{level: 0, score: 1.73})
 		switch err {
 		case errFillTables:
@@ -625,6 +661,7 @@ func (db *DB) close() (err error) {
 	}
 
 	db.opt.Infof(db.LevelsToString())
+	//
 	if lcErr := db.lc.close(); err == nil {
 		err = y.Wrap(lcErr, "DB.Close")
 	}
@@ -650,6 +687,7 @@ func (db *DB) close() (err error) {
 			err = y.Wrap(guardErr, "DB.Close")
 		}
 	}
+
 	if manifestErr := db.manifest.close(); err == nil {
 		err = y.Wrap(manifestErr, "DB.Close")
 	}
@@ -725,7 +763,7 @@ func (db *DB) getMemTables() ([]*memTable, func()) {
 	var tables []*memTable
 
 	// Mutable memtable does not exist in read-only mode.
-	if !db.opt.ReadOnly {
+	if !db.opt.ReadOnly { // 非只读模式;
 		// Get mutable memtable.
 		tables = append(tables, db.mt)
 		db.mt.IncrRef()
@@ -758,33 +796,46 @@ func (db *DB) getMemTables() ([]*memTable, func()) {
 // do that. For every get("fooX") call where X is the version, we will search
 // for "fooX" in all the levels of the LSM tree. This is expensive but it
 // removes the overhead of handling move keys completely.
-func (db *DB) get(key []byte) (y.ValueStruct, error) {
+func (db *DB) get(keyMaxReadTs []byte) (y.ValueStruct, error) {
 	if db.IsClosed() {
 		return y.ValueStruct{}, ErrDBClosed
 	}
+	// 获得内存表;
 	tables, decr := db.getMemTables() // Lock should be released.
 	defer decr()
 
 	var maxVs y.ValueStruct
-	version := y.ParseTs(key)
-
+	// 此时key已经挂上了 max - readTs;
+	// 解析出真正的 readTs;
+	readTsVersion := y.ParseTs(keyMaxReadTs)
+	// 指标开启;
 	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
 	for i := 0; i < len(tables); i++ {
-		vs := tables[i].sl.Get(key)
+		// 内存跳表中查询; 此时的 vs 数据 可能仅仅是原生key相同,但是 版本不同, 或小;
+		vs := tables[i].sl.Get(keyMaxReadTs)
+		// 返回内存表的查询次数进行累计的统计指标;
 		y.NumMemtableGetsAdd(db.opt.MetricsEnabled, 1)
 		if vs.Meta == 0 && vs.Value == nil {
+			// 没找到, 继续下一个表;
 			continue
 		}
 		// Found the required version of the key, return immediately.
-		if vs.Version == version {
+		if vs.Version == readTsVersion { // todo 什么情况下会相同? 答复:事务1刚写入,事务2get,版本就会相同; 但是事务5get时,版本就会不一致;
+			// 返回有效结果的查询次数进行累计的统计指标;
 			y.NumGetsWithResultsAdd(db.opt.MetricsEnabled, 1)
 			return vs, nil
 		}
+		// 是有可能返回的vs的版本大于 当前 keyMaxReadTs 版本的;
+		// 但是是不会 大于 readTsVersion的;
 		if maxVs.Version < vs.Version {
+			// 保存下来, 继续下一个表;
 			maxVs = vs
 		}
-	}
-	return db.lc.get(key, maxVs, 0)
+	} // skip over
+
+	// 携带 跳表中存在的 最大 版本号, 再进行寻找;
+	// 假如 level中没有找到的话, 就返回之前在跳表中的结果,虽然不是 100% version相同;
+	return db.lc.get(keyMaxReadTs, maxVs, 0)
 }
 
 var requestPool = sync.Pool{
@@ -800,14 +851,16 @@ func (db *DB) writeToLSM(b *request) error {
 	if !db.opt.InMemory && len(b.Ptrs) != len(b.Entries) {
 		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
 	}
-
+	// todo 批量写入 lsm 中途出现失败怎么办?
 	for i, entry := range b.Entries {
 		var err error
+		// 判断当前 entry.value 是否需要写入 LSM;
 		if entry.skipVlogAndSetThreshold(db.valueThreshold()) {
 			// Will include deletion / tombstone case.
+			// < key:max-readTs, value >
 			err = db.mt.Put(entry.Key,
 				y.ValueStruct{
-					Value: entry.Value,
+					Value: entry.Value, // 原始 value bytes[]
 					// Ensure value pointer flag is removed. Otherwise, the value will fail
 					// to be retrieved during iterator prefetch. `bitValuePointer` is only
 					// known to be set in write to LSM when the entry is loaded from a backup
@@ -816,7 +869,7 @@ func (db *DB) writeToLSM(b *request) error {
 					UserMeta:  entry.UserMeta,
 					ExpiresAt: entry.ExpiresAt,
 				})
-		} else {
+		} else { // value 过大, 把之前的 在.vlog文件中的 valuePointer 编码进去;
 			// Write pointer to Memtable.
 			err = db.mt.Put(entry.Key,
 				y.ValueStruct{
@@ -826,10 +879,12 @@ func (db *DB) writeToLSM(b *request) error {
 					ExpiresAt: entry.ExpiresAt,
 				})
 		}
+
 		if err != nil {
 			return y.Wrapf(err, "while writing to memTable")
 		}
 	}
+	// 同步刷新一下 wal;
 	if db.opt.SyncWrites {
 		return db.mt.SyncWAL()
 	}
@@ -848,7 +903,12 @@ func (db *DB) writeRequests(reqs []*request) error {
 			r.Wg.Done()
 		}
 	}
+
 	db.opt.Debugf("writeRequests called. Writing to value log")
+
+	// 1. txN.commit()
+	// 2. vlogGC
+	// vlog.write(reqs); 会进行判断,适合的就进vlog,不合适的就进LSM;
 	err := db.vlog.write(reqs)
 	if err != nil {
 		done(err)
@@ -864,6 +924,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		count += len(b.Entries)
 		var i uint64
 		var err error
+		// 确保 内存表中 有剩余空间;
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -874,10 +935,12 @@ func (db *DB) writeRequests(reqs []*request) error {
 			// you will get a deadlock.
 			time.Sleep(10 * time.Millisecond)
 		}
+
 		if err != nil {
 			done(err)
 			return y.Wrap(err, "writeRequests")
 		}
+		// 发送到 LSM 中;
 		if err := db.writeToLSM(b); err != nil {
 			done(err)
 			return y.Wrap(err, "writeRequests")
@@ -885,6 +948,8 @@ func (db *DB) writeRequests(reqs []*request) error {
 	}
 
 	db.opt.Debugf("Sending updates to subscribers")
+
+	// 发布 事件
 	db.pub.sendUpdates(reqs)
 
 	done(nil)
@@ -898,6 +963,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	}
 	var count, size int64
 	for _, e := range entries {
+		// 预估计算 这批 entries 大小;
 		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
 		count++
 	}
@@ -906,6 +972,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 		return nil, ErrTxnTooBig
 	}
 
+	// 我们只能服务一个请求，因为我们需要将每个txn存储在一个连续的部分中;
 	// We can only service one request because we need each txn to be stored in a contiguous section.
 	// Txns should not interleave among other txns or rewrites.
 	req := requestPool.Get().(*request)
@@ -915,7 +982,6 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req.IncrRef()     // for db write
 	db.writeCh <- req // Handled in doWrites.
 	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
-
 	return req, nil
 }
 
@@ -927,17 +993,21 @@ func (db *DB) doWrites(lc *z.Closer) {
 		if err := db.writeRequests(reqs); err != nil {
 			db.opt.Errorf("writeRequests: %v", err)
 		}
+		// 下次只能等上一次结束, 所以需要等待;
 		<-pendingCh
 	}
 
 	// This variable tracks the number of pending writes.
 	reqLen := new(expvar.Int)
 	y.PendingWritesSet(db.opt.MetricsEnabled, db.opt.Dir, reqLen)
-
 	reqs := make([]*request, 0, 10)
-	for {
+	for { // readCase   closedCase   writeCase
+
 		var r *request
+
 		select {
+		// 1. txN.commit() 会将内存中的数据 发送到此通道中;
+		// 2. vlog.db.batchSet(wb);
 		case r = <-db.writeCh:
 		case <-lc.HasBeenClosed():
 			goto closedCase
@@ -969,7 +1039,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 			select {
 			case r = <-db.writeCh:
 				reqs = append(reqs, r)
-			default:
+			default: // b.writeCh 中没有更多数据, 执行 default 分支;
 				pendingCh <- struct{}{} // Push to pending before doing a write.
 				writeRequests(reqs)
 				return
@@ -980,7 +1050,8 @@ func (db *DB) doWrites(lc *z.Closer) {
 		go writeRequests(reqs)
 		reqs = make([]*request, 0, 10)
 		reqLen.Set(0)
-	}
+
+	} // for over
 }
 
 // batchSet applies a list of badger.Entry. If a request level error occurs it
@@ -988,6 +1059,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 //
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
+	// 直接发向db写入, 非txn层;
 	req, err := db.sendToWriteCh(entries)
 	if err != nil {
 		return err
@@ -1025,14 +1097,14 @@ func (db *DB) ensureRoomForWrite() error {
 	defer db.lock.Unlock()
 
 	y.AssertTrue(db.mt != nil) // A nil mt indicates that DB is being closed.
+	// 判断 skl是否满了, 或者判断 wal 是否满了;
 	if !db.mt.isFull() {
 		return nil
 	}
 
 	select {
 	case db.flushChan <- db.mt:
-		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
-			db.mt.sl.MemSize(), len(db.flushChan))
+		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n", db.mt.sl.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt)
 		db.mt, err = db.newMemTable()
@@ -1054,10 +1126,11 @@ func arenaSize(opt Options) int64 {
 // buildL0Table builds a new table from the memtable.
 func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *table.Builder {
 	defer iter.Close()
-
+	// 新建builder;
 	b := table.NewTableBuilder(bopts)
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		if len(dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), dropPrefixes) {
+			// 跳过某种key;
 			continue
 		}
 		vs := iter.Value()
@@ -1065,27 +1138,31 @@ func buildL0Table(iter y.Iterator, dropPrefixes [][]byte, bopts table.Options) *
 		if vs.Meta&bitValuePointer > 0 {
 			vp.Decode(vs.Value)
 		}
+		// todo builder 增加 key: key:max-commitTS, version: commitTs;
 		b.Add(iter.Key(), iter.Value(), vp.Len)
 	}
-
 	return b
 }
 
 // handleMemTableFlush must be run serially.
 func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
+	// 构建刷盘参数;
 	bopts := buildTableOptions(db)
+	// 是否逆序;
 	itr := mt.sl.NewUniIterator(false)
+	// 构建builder;
 	builder := buildL0Table(itr, nil, bopts)
 	defer builder.Close()
 
 	// buildL0Table can return nil if the none of the items in the skiplist are
-	// added to the builder. This can happen when drop prefix is set and all
-	// the items are skipped.
+	// added to the builder.
+	// This can happen when drop prefix is set and all the items are skipped.
+	// 当设置了删除前缀并跳过所有项时，就会发生这种情况。
 	if builder.Empty() {
 		builder.Finish()
 		return nil
 	}
-
+	// 获得新tableId
 	fileID := db.lc.reserveFileID()
 	var tbl *table.Table
 	var err error
@@ -1109,12 +1186,15 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 func (db *DB) flushMemtable(lc *z.Closer) {
 	defer lc.Done()
 
+	// 当db.stopMemoryFlush() 被调用时,当前for{}会立即结束;
+	// 并且没有数据可读,等待通道中有数据到来;
 	for mt := range db.flushChan {
 		if mt == nil {
 			continue
 		}
 
 		for {
+			// 处理刷盘, tableBuilder;
 			if err := db.handleMemTableFlush(mt, nil); err != nil {
 				// Encountered error. Retry indefinitely.
 				db.opt.Errorf("error flushing memtable to disk: %v, retrying", err)
@@ -1223,6 +1303,7 @@ func (db *DB) updateSize(lc *z.Closer) {
 //
 // If a call to RunValueLogGC results in no rewrites, then an ErrNoRewrite is
 // thrown indicating that the call resulted in no file rewrites.
+// 如果调用RunValueLogGC没有导致重写，则调用ErrNoRewrite 抛出，表明调用没有导致文件重写;
 //
 // We recommend setting discardRatio to 0.5, thus indicating that a file be
 // rewritten if half the space can be discarded.  This results in a lifetime
@@ -1247,11 +1328,12 @@ func (db *DB) RunValueLogGC(discardRatio float64) error {
 	}
 
 	// Pick a log file and run GC
+	// todo vlogGC
 	return db.vlog.runGC(discardRatio)
 }
 
-// Size returns the size of lsm and value log files in bytes. It can be used to decide how often to
-// call RunValueLogGC.
+// Size returns the size of lsm and value log files in bytes.
+// It can be used to decide how often to call RunValueLogGC.
 func (db *DB) Size() (lsm, vlog int64) {
 	if y.LSMSizeGet(db.opt.MetricsEnabled, db.opt.Dir) == nil {
 		lsm, vlog = 0, 0
@@ -1533,7 +1615,7 @@ func (db *DB) MaxBatchSize() int64 {
 func (db *DB) stopMemoryFlush() {
 	// Stop memtable flushes.
 	if db.closers.memtable != nil {
-		close(db.flushChan)
+		close(db.flushChan) // 相关处理刷盘协程会退出;
 		db.closers.memtable.SignalAndWait()
 	}
 }

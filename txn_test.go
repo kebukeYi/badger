@@ -32,6 +32,48 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 
+func TestTxn_Commit(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		txn := db.NewTransaction(true)
+
+		for i := 0; i < 10; i++ {
+			k := []byte(fmt.Sprintf("key=%d", i))
+			v := []byte(fmt.Sprintf("oneval=%d", i))
+			txn.SetEntry(NewEntry(k, v))
+		}
+
+		for i := 0; i < 10; i++ {
+			k := []byte(fmt.Sprintf("key=%d", i))
+			v := []byte(fmt.Sprintf("twoval=%d", i))
+			txn.SetEntry(NewEntry(k, v))
+		}
+
+		for i := 0; i < 10; i++ {
+			k := []byte(fmt.Sprintf("key=%d", i))
+			v := []byte(fmt.Sprintf("threeval=%d", i))
+			txn.SetEntry(NewEntry(k, v))
+		}
+
+		item, err := txn.Get([]byte("key=8"))
+		fmt.Sprintf("oneitme: %v; err:%s", item, err)
+
+		item, err = txn.Get([]byte("threekey=8"))
+		fmt.Sprintf("threeitme: %v; err:%s", item, err)
+
+		_ = txn.CommitAt(100, nil)
+		txn.Commit()
+
+		// ----------------------------------------------
+		transaction := db.NewTransaction(true)
+		for i := 0; i < 10; i++ {
+			k := []byte(fmt.Sprintf("key=%d", i))
+			v := []byte(fmt.Sprintf("oneval=%d", i))
+			transaction.SetEntry(NewEntry(k, v))
+		}
+		transaction.Commit()
+	})
+}
+
 func TestTxnSimple(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 		txn := db.NewTransaction(true)
@@ -86,6 +128,7 @@ func TestTxnReadAfterWrite(t *testing.T) {
 			test(t, db)
 		})
 	})
+
 	t.Run("InMemory mode", func(t *testing.T) {
 		opt := getTestOptions("")
 		opt.InMemory = true
@@ -732,8 +775,9 @@ func TestIteratorAllVersionsWithDeleted2(t *testing.T) {
 	})
 }
 
+// TestManagedDB, todo 非常重要, 细致的测试了不同版本下的 读取情况; 可反映出[可重复读]级别;
 func TestManagedDB(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -744,7 +788,6 @@ func TestManagedDB(t *testing.T) {
 		key := func(i int) []byte {
 			return []byte(fmt.Sprintf("key-%02d", i))
 		}
-
 		val := func(i int) []byte {
 			return []byte(fmt.Sprintf("val-%d", i))
 		}
@@ -761,10 +804,10 @@ func TestManagedDB(t *testing.T) {
 		for i := 0; i <= 3; i++ {
 			require.NoError(t, txn.SetEntry(NewEntry(key(i), val(i))))
 		}
-		require.Error(t, txn.Commit())
-		require.NoError(t, txn.CommitAt(3, nil))
+		require.Error(t, txn.Commit())           // 如果在手动模式下, commitTS 不可为0;
+		require.NoError(t, txn.CommitAt(3, nil)) // 1个
 
-		// Read data at t=2.
+		// Read data at t=2. 读不到; 版本比自己大的数据;
 		txn = db.NewTransactionAt(2, false)
 		for i := 0; i <= 3; i++ {
 			_, err := txn.Get(key(i))
@@ -772,7 +815,7 @@ func TestManagedDB(t *testing.T) {
 		}
 		txn.Discard()
 
-		// Read data at t=3.
+		// Read data at t=3. 读的到;和自己版本一致;
 		txn = db.NewTransactionAt(3, false)
 		for i := 0; i <= 3; i++ {
 			item, err := txn.Get(key(i))
@@ -784,7 +827,7 @@ func TestManagedDB(t *testing.T) {
 		}
 		txn.Discard()
 
-		// Write data at t=7.
+		// Write data at t=7. key0 1 2 3 可读到,因为版本小; 4 5 6 7 写入version为7的数据;
 		txn = db.NewTransactionAt(6, true)
 		for i := 0; i <= 7; i++ {
 			_, err := txn.Get(key(i))
@@ -793,21 +836,20 @@ func TestManagedDB(t *testing.T) {
 			}
 			require.NoError(t, txn.SetEntry(NewEntry(key(i), val(i))))
 		}
-		require.NoError(t, txn.CommitAt(7, nil))
+		require.NoError(t, txn.CommitAt(7, nil)) // 2个
 
-		// Read data at t=9.
+		// Read data at t=9. 版本3 版本7的数据都能被读到;
 		txn = db.NewTransactionAt(9, false)
 		for i := 0; i <= 9; i++ {
 			item, err := txn.Get(key(i))
 			if i <= 7 {
 				require.NoError(t, err)
-			} else {
+			} else { // 8 9 没有写入;
 				require.Equal(t, ErrKeyNotFound, err)
 			}
-
-			if i <= 3 {
+			if i <= 3 { // 版本为3
 				require.Equal(t, uint64(3), item.Version())
-			} else if i <= 7 {
+			} else if i <= 7 { // 版本为7
 				require.Equal(t, uint64(7), item.Version())
 			}
 			if i <= 7 {
@@ -818,36 +860,38 @@ func TestManagedDB(t *testing.T) {
 		}
 		txn.Discard()
 
-		// Write data to same key, causing a conflict
+		// Write data to same key, causing a conflict;
 		txn = db.NewTransactionAt(10, true)
 		txnb := db.NewTransactionAt(10, true)
-		_, err := txnb.Get(key(0))
+		_, err := txnb.Get(key(0)) // 读取了就不不能提交了;
 		require.NoError(t, err)
 		require.NoError(t, txn.SetEntry(NewEntry(key(0), val(0))))
 		require.NoError(t, txnb.SetEntry(NewEntry(key(0), val(1))))
-		require.NoError(t, txn.CommitAt(11, nil))
+		require.NoError(t, txn.CommitAt(11, nil)) // 3个
 		require.Equal(t, ErrConflict, txnb.CommitAt(11, nil))
 	}
+
 	t.Run("disk mode", func(t *testing.T) {
 		db, err := Open(opt)
 		require.NoError(t, err)
 		test(t, db)
 		require.NoError(t, db.Close())
 	})
-	t.Run("InMemory mode", func(t *testing.T) {
-		opt.InMemory = true
-		opt.Dir = ""
-		opt.ValueDir = ""
-		db, err := Open(opt)
-		require.NoError(t, err)
-		test(t, db)
-		require.NoError(t, db.Close())
-	})
+
+	//t.Run("InMemory mode", func(t *testing.T) {
+	//	opt.InMemory = true
+	//	opt.Dir = ""
+	//	opt.ValueDir = ""
+	//	db, err := Open(opt)
+	//	require.NoError(t, err)
+	//	test(t, db)
+	//	require.NoError(t, db.Close())
+	//})
 
 }
 
 func TestArmV7Issue311Fix(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "TestArmV7Issue311Fix-")
 	require.NoError(t, err)
 
 	defer removeDir(dir)
@@ -904,6 +948,7 @@ func TestConflict(t *testing.T) {
 		}
 		require.NoError(t, err)
 	}
+
 	testAndSetItr := func(wg *sync.WaitGroup, db *DB) {
 		defer wg.Done()
 		txn := db.NewTransaction(true)

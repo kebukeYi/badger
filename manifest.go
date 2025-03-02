@@ -131,6 +131,7 @@ func openOrCreateManifestFile(opt Options) (
 	if opt.InMemory {
 		return &manifestFile{inMemory: true}, Manifest{}, nil
 	}
+	//
 	return helpOpenOrCreateManifestFile(opt.Dir, opt.ReadOnly, opt.ExternalMagicVersion,
 		manifestDeletionsRewriteThreshold)
 }
@@ -143,6 +144,7 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, extMagic uint16,
 	if readOnly {
 		flags |= y.ReadOnly
 	}
+	// 尝试打开存在的文件, 不存在则报错;
 	fp, err := y.OpenExistingFile(path, flags) // We explicitly sync in addChanges, outside the lock.
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -151,7 +153,9 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, extMagic uint16,
 		if readOnly {
 			return nil, Manifest{}, fmt.Errorf("no manifest found, required for read-only db")
 		}
+		//
 		m := createManifest()
+		//
 		fp, netCreations, err := helpRewrite(dir, &m, extMagic)
 		if err != nil {
 			return nil, Manifest{}, err
@@ -312,7 +316,6 @@ func helpRewrite(dir string, m *Manifest, extMagic uint16) (*os.File, int, error
 		fp.Close()
 		return nil, 0, err
 	}
-
 	return fp, netCreations, nil
 }
 

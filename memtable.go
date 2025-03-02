@@ -127,13 +127,14 @@ func (db *DB) openMemTable(fid, flags int) (*memTable, error) {
 		writeAt:  vlogHeaderSize,
 		opt:      db.opt,
 	}
+	// 打开wal
 	lerr := mt.wal.open(filepath, flags, 2*db.opt.MemTableSize)
 	if lerr != z.NewFile && lerr != nil {
 		return nil, y.Wrapf(lerr, "While opening memtable: %s", filepath)
 	}
 
-	// Have a callback set to delete WAL when skiplist reference count goes down to zero. That is,
-	// when it gets flushed to L0.
+	// Have a callback set to delete WAL when skiplist reference count goes down to zero.
+	// That is, when it gets flushed to L0.
 	s.OnClose = func() {
 		if err := mt.wal.Delete(); err != nil {
 			db.opt.Errorf("while deleting file: %s, err: %v", filepath, err)
@@ -191,12 +192,13 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 
 	// wal is nil only when badger in running in in-memory mode and we don't need the wal.
 	if mt.wal != nil {
-		// If WAL exceeds opt.ValueLogFileSize, we'll force flush the memTable. See logic in
-		// ensureRoomForWrite.
+		// If WAL exceeds opt.ValueLogFileSize, we'll force flush the memTable.
+		// See logic in ensureRoomForWrite.
 		if err := mt.wal.writeEntry(mt.buf, entry, mt.opt); err != nil {
 			return y.Wrapf(err, "cannot write entry to WAL file")
 		}
 	}
+
 	// We insert the finish marker in the WAL but not in the memtable.
 	if entry.meta&bitFinTxn > 0 {
 		return nil
@@ -204,7 +206,9 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 
 	// Write to skiplist and update maxVersion encountered.
 	mt.sl.Put(key, value)
-	if ts := y.ParseTs(entry.Key); ts > mt.maxVersion {
+	// 每次都更新最新版本;
+	ts := y.ParseTs(entry.Key)
+	if ts > mt.maxVersion {
 		mt.maxVersion = ts
 	}
 	y.NumBytesWrittenToL0Add(mt.opt.MetricsEnabled, entry.estimateSizeAndSetThreshold(mt.opt.ValueThreshold))
@@ -215,6 +219,7 @@ func (mt *memTable) UpdateSkipList() error {
 	if mt.wal == nil || mt.sl == nil {
 		return nil
 	}
+	// 文件迭代器
 	endOff, err := mt.wal.iterate(true, 0, mt.replayFunction(mt.opt))
 	if err != nil {
 		return y.Wrapf(err, "while iterating wal: %s", mt.wal.Fd.Name())
@@ -446,10 +451,11 @@ func (lf *logFile) doneWriting(offset uint32) error {
 func (lf *logFile) iterate(readOnly bool, offset uint32, fn logEntry) (uint32, error) {
 	if offset == 0 {
 		// If offset is set to zero, let's advance past the encryption key header.
+		// 直接跳过加密头;
 		offset = vlogHeaderSize
 	}
 
-	// For now, read directly from file, because it allows
+	// For now, read directly from file, because it allows;
 	reader := bufio.NewReader(lf.NewReader(int(offset)))
 	read := &safeRead{
 		k:            make([]byte, 10),
@@ -468,9 +474,8 @@ loop:
 	for {
 		e, err := read.Entry(reader)
 		switch {
-		// We have not reached the end of the file but the entry we read is
-		// zero. This happens because we have truncated the file and
-		// zero'ed it out.
+		// We have not reached the end of the file but the entry we read is zero.
+		// This happens because we have truncated the file and zero'ed it out.
 		case err == io.EOF:
 			break loop
 		case err == io.ErrUnexpectedEOF || err == errTruncate:
@@ -491,7 +496,7 @@ loop:
 		vp.Fid = lf.fid
 
 		switch {
-		case e.meta&bitTxn > 0:
+		case e.meta&bitTxn > 0: // 如果当前 e 是事务的一部分;
 			txnTs := y.ParseTs(e.Key)
 			if lastCommit == 0 {
 				lastCommit = txnTs
@@ -502,8 +507,9 @@ loop:
 			entries = append(entries, e)
 			vptrs = append(vptrs, vp)
 
-		case e.meta&bitFinTxn > 0:
+		case e.meta&bitFinTxn > 0: // 如果当前 e 是事务的结束标志;
 			txnTs, err := strconv.ParseUint(string(e.Value), 10, 64)
+			// 必须相等;
 			if err != nil || lastCommit != txnTs {
 				break loop
 			}
@@ -513,6 +519,8 @@ loop:
 
 			for i, e := range entries {
 				vp := vptrs[i]
+				// 1.openDB()时, fn()为空;
+				// 2.rewrite(), fn()不为空;
 				if err := fn(*e, vp); err != nil {
 					if err == errStop {
 						break
@@ -524,7 +532,7 @@ loop:
 			vptrs = vptrs[:0]
 
 		default:
-			if lastCommit != 0 {
+			if lastCommit != 0 { // 处在GC过程中的 e;
 				// This is most likely an entry which was moved as part of GC.
 				// We shouldn't get this entry in the middle of a transaction.
 				break loop
@@ -573,8 +581,7 @@ func (lf *logFile) open(path string, flags int, fsize int64) error {
 	// Copy over the encryption registry data.
 	buf := make([]byte, vlogHeaderSize)
 
-	y.AssertTruef(vlogHeaderSize == copy(buf, lf.Data),
-		"Unable to copy from %s, size %d", path, lf.size.Load())
+	y.AssertTruef(vlogHeaderSize == copy(buf, lf.Data), "Unable to copy from %s, size %d", path, lf.size.Load())
 	keyID := binary.BigEndian.Uint64(buf[:8])
 	// retrieve datakey.
 	if dk, err := lf.registry.DataKey(keyID); err != nil {

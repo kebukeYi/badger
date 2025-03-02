@@ -124,6 +124,7 @@ func (r *safeRead) Entry(reader io.Reader) (*Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if h.klen > uint32(1<<16) { // Key length must be below uint16.
 		return nil, errTruncate
 	}
@@ -161,7 +162,8 @@ func (r *safeRead) Entry(reader io.Reader) (*Entry, error) {
 		return nil, err
 	}
 	crc := y.BytesToU32(crcBuf[:])
-	if crc != tee.Sum32() {
+	sum32 := tee.Sum32()
+	if crc != sum32 {
 		return nil, errTruncate
 	}
 	e.meta = h.meta
@@ -178,70 +180,98 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			return errors.Errorf("value log file already marked for deletion fid: %d", fid)
 		}
 	}
+
 	maxFid := vlog.maxFid
 	y.AssertTruef(f.fid < maxFid, "fid to move: %d. Current max fid: %d", f.fid, maxFid)
 	vlog.filesLock.RUnlock()
+	// 检查 fid 边界结束;
 
 	vlog.opt.Infof("Rewriting fid: %d", f.fid)
 	wb := make([]*Entry, 0, 1000)
+	tempWb := make([]string, 0)
 	var size int64
 
 	y.AssertTrue(vlog.db != nil)
 	var count, moved int
-	fe := func(e Entry) error {
+	// 2.装填 vlog 中的数据;
+	fe := func(vlogEntry Entry) error {
 		count++
 		if count%100000 == 0 {
 			vlog.opt.Debugf("Processing entry %d", count)
 		}
-
-		vs, err := vlog.db.get(e.Key)
+		var lsmEntry y.ValueStruct
+		var err error
+		// 此时从 vlog中遍历到的 entry的版本号, 很可能是小于lsm中新数据的版本号的? 那怎么能读取到新值呢?
+		// 1.先从 LSM 中获取 key 的相符合的版本值;
+		//if bytes.Compare(y.ParseKey(vlogEntry.Key), []byte("key0")) == 0 {
+		if bytes.Compare(y.ParseKey(vlogEntry.Key), []byte("test0")) == 0 {
+			// 假设低版本的 key0 数据 在lsm中被合并丢弃掉;
+			// 那么 lsmEntry = nil;
+		} else {
+			lsmEntry, err = vlog.db.get(vlogEntry.Key)
+		}
 		if err != nil {
 			return err
 		}
-		if discardEntry(e, vs, vlog.db) {
+
+		// 根据lsm返回的结果, 判断当前 vlog 中的 Entry 是否可抛弃;
+		// 可能:vlog 中的 entry信息太久, 相关entry信息在lsm内部发生合并时,被清理掉;
+		if discardEntry(vlogEntry, lsmEntry, vlog.db) {
 			return nil
 		}
 
 		// Value is still present in value log.
-		if len(vs.Value) == 0 {
-			return errors.Errorf("Empty value: %+v", vs)
+		// 值仍然存在于值日志中;
+
+		// lsmVS.Version != 0; value 应该存在有效值的; 正常情况下不能为空;
+		if len(lsmEntry.Value) == 0 {
+			return errors.Errorf("Empty value: %+v  from lsm;", lsmEntry)
 		}
+
 		var vp valuePointer
-		vp.Decode(vs.Value)
+		vp.Decode(lsmEntry.Value)
 
 		// If the entry found from the LSM Tree points to a newer vlog file, don't do anything.
 		if vp.Fid > f.fid {
 			return nil
 		}
+		// vp.Fid <= f.fid
 		// If the entry found from the LSM Tree points to an offset greater than the one
 		// read from vlog, don't do anything.
-		if vp.Offset > e.offset {
+		if vp.Offset > vlogEntry.offset {
+			// 可继续等待到下一轮的读取到此值;
 			return nil
 		}
+		// vp.Fid <= f.fid && vp.Offset <= e.offset
+
 		// If the entry read from LSM Tree and vlog file point to the same vlog file and offset,
 		// insert them back into the DB.
 		// NOTE: It might be possible that the entry read from the LSM Tree points to
 		// an older vlog file. See the comments in the else part.
-		if vp.Fid == f.fid && vp.Offset == e.offset {
+		// 1. 实打实的有效数据,直接重新写入lsm中,会进入新vlog文件中;
+		// 2. 无效数据还没被lsmGC清理掉, 虽然也会进入新vlog文件中, 但是后续lsmGC+vlogGC, 肯定会清理掉的;
+		if vp.Fid == f.fid && vp.Offset == vlogEntry.offset {
+			// 移动到新的 vlog 文件中;
+			tempWb = append(tempWb, string(vlogEntry.Key))
 			moved++
 			// This new entry only contains the key, and a pointer to the value.
 			ne := new(Entry)
-			// Remove only the bitValuePointer and transaction markers. We
-			// should keep the other bits.
-			ne.meta = e.meta &^ (bitValuePointer | bitTxn | bitFinTxn)
-			ne.UserMeta = e.UserMeta
-			ne.ExpiresAt = e.ExpiresAt
-			ne.Key = append([]byte{}, e.Key...)
-			ne.Value = append([]byte{}, e.Value...)
+			// Remove only the bitValuePointer and transaction markers.
+			// We should keep the other bits.
+			ne.meta = vlogEntry.meta &^ (bitValuePointer | bitTxn | bitFinTxn)
+			ne.UserMeta = vlogEntry.UserMeta
+			ne.ExpiresAt = vlogEntry.ExpiresAt
+			ne.Key = append([]byte{}, vlogEntry.Key...)
+			ne.Value = append([]byte{}, vlogEntry.Value...)
 			es := ne.estimateSizeAndSetThreshold(vlog.db.valueThreshold())
 			// Consider size of value as well while considering the total size
 			// of the batch. There have been reports of high memory usage in
 			// rewrite because we don't consider the value size. See #1292.
-			es += int64(len(e.Value))
+			es += int64(len(vlogEntry.Value))
 
 			// Ensure length and size of wb is within transaction limits.
-			if int64(len(wb)+1) >= vlog.opt.maxBatchCount ||
-				size+es >= vlog.opt.maxBatchSize {
+			if int64(len(wb)+1) >= vlog.opt.maxBatchCount || size+es >= vlog.opt.maxBatchSize {
+				// 批量发送给DB;
 				if err := vlog.db.batchSet(wb); err != nil {
 					return err
 				}
@@ -250,16 +280,17 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			}
 			wb = append(wb, ne)
 			size += es
-		} else { //nolint:staticcheck
+		} else {
+			// 旧文件
+			// vp.Fid < f.fid && vp.Offset < e.offset
+			//nolint:staticcheck
 			// It might be possible that the entry read from LSM Tree points to
 			// an older vlog file.  This can happen in the following situation.
-			// Assume DB is opened with
-			// numberOfVersionsToKeep=1
+			// Assume DB is opened with numberOfVersionsToKeep=1
 			//
 			// Now, if we have ONLY one key in the system "FOO" which has been
 			// updated 3 times and the same key has been garbage collected 3
-			// times, we'll have 3 versions of the movekey
-			// for the same key "FOO".
+			// times, we'll have 3 versions of the movekey for the same key "FOO".
 			//
 			// NOTE: moveKeyi is the gc'ed version of the original key with version i
 			// We're calling the gc'ed keys as moveKey to simplify the
@@ -305,13 +336,17 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		return nil
 	}
 
+	// 1.开始遍历 vlog 文件中的 entry;
 	_, err := f.iterate(vlog.opt.ReadOnly, 0, func(e Entry, vp valuePointer) error {
+		// 只要 e;
 		return fe(e)
 	})
+
 	if err != nil {
 		return err
 	}
 
+	// 3.批量将 wb 数据写入到 DB;
 	batchSize := 1024
 	var loops int
 	for i := 0; i < len(wb); {
@@ -337,8 +372,9 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	vlog.opt.Infof("Processed %d entries in %d loops", len(wb), loops)
 	vlog.opt.Infof("Total entries: %d. Moved: %d", count, moved)
 	vlog.opt.Infof("Removing fid: %d", f.fid)
+
 	var deleteFileNow bool
-	// Entries written to LSM. Remove the older file now.
+	// 4.Entries written to LSM. Remove the older file now.
 	{
 		vlog.filesLock.Lock()
 		// Just a sanity-check.
@@ -531,7 +567,6 @@ func (vlog *valueLog) createVlogFile() (*logFile, error) {
 	vlog.writableLogOffset.Store(vlogHeaderSize)
 	vlog.numEntriesWritten = 0
 	vlog.filesLock.Unlock()
-
 	return lf, nil
 }
 
@@ -574,9 +609,11 @@ func (vlog *valueLog) open(db *DB) error {
 		if vlog.opt.ReadOnly {
 			return nil
 		}
+		// mmap 映射的大小  1MB <= size < 2GB
 		_, err := vlog.createVlogFile()
 		return y.Wrapf(err, "Error while creating log file in valueLog.open")
 	}
+	// 从小到大的排列;
 	fids := vlog.sortedFids()
 	for _, fid := range fids {
 		lf, ok := vlog.filesMap[fid]
@@ -584,8 +621,7 @@ func (vlog *valueLog) open(db *DB) error {
 
 		// Just open in RDWR mode. This should not create a new log file.
 		lf.opt = vlog.opt
-		if err := lf.open(vlog.fpath(fid), os.O_RDWR,
-			2*vlog.opt.ValueLogFileSize); err != nil {
+		if err := lf.open(vlog.fpath(fid), os.O_RDWR, 2*vlog.opt.ValueLogFileSize); err != nil {
 			return y.Wrapf(err, "Open existing file: %q", lf.path)
 		}
 		// We shouldn't delete the maxFid file.
@@ -601,18 +637,20 @@ func (vlog *valueLog) open(db *DB) error {
 	if vlog.opt.ReadOnly {
 		return nil
 	}
-	// Now we can read the latest value log file, and see if it needs truncation. We could
-	// technically do this over all the value log files, but that would mean slowing down the value
+	// Now we can read the latest value log file, and see if it needs truncation.
+	// We could technically do this over all the value log files, but that would mean slowing down the value
 	// log open.
 	last, ok := vlog.filesMap[vlog.maxFid]
 	y.AssertTrue(ok)
 	lastOff, err := last.iterate(vlog.opt.ReadOnly, vlogHeaderSize,
 		func(_ Entry, vp valuePointer) error {
+			// 什么也不干, 不重写; 仅仅是更新文件的有效数据;
 			return nil
 		})
 	if err != nil {
 		return y.Wrapf(err, "while iterating over: %s", last.path)
 	}
+	// 截断一下;
 	if err := last.Truncate(int64(lastOff)); err != nil {
 		return y.Wrapf(err, "while truncating last value log file: %s", last.path)
 	}
@@ -643,6 +681,7 @@ func (vlog *valueLog) Close() error {
 		}
 	}
 	if vlog.discardStats != nil {
+		// 捕获
 		vlog.db.captureDiscardStats()
 		if terr := vlog.discardStats.Close(-1); terr != nil && err == nil {
 			err = terr
@@ -763,11 +802,12 @@ func (vlog *valueLog) validateWrites(reqs []*request) error {
 		// calculate size of the request.
 		size := estimateRequestSize(req)
 		estimatedVlogOffset := vlogOffset + size
+		// 过于超大;
 		if estimatedVlogOffset > uint64(maxVlogFileSize) {
 			return errors.Errorf("Request size offset %d is bigger than maximum offset %d",
 				estimatedVlogOffset, maxVlogFileSize)
 		}
-
+		// 不过分大, 可以理解;
 		if estimatedVlogOffset >= uint64(vlog.opt.ValueLogFileSize) {
 			// We'll create a new vlog file if the estimated offset is greater or equal to
 			// max vlog size. So, resetting the vlogOffset.
@@ -794,8 +834,8 @@ func (vlog *valueLog) write(reqs []*request) error {
 	if vlog.db.opt.InMemory {
 		return nil
 	}
-	// Validate writes before writing to vlog. Because, we don't want to partially write and return
-	// an error.
+	// Validate writes before writing to vlog.
+	// Because, we don't want to partially write and return an error.
 	if err := vlog.validateWrites(reqs); err != nil {
 		return y.Wrapf(err, "while validating writes")
 	}
@@ -813,6 +853,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		}
 	}()
 
+	// 将buf中的数据 copy到 vlogFile.Data 中;
 	write := func(buf *bytes.Buffer) error {
 		if buf.Len() == 0 {
 			return nil
@@ -823,12 +864,14 @@ func (vlog *valueLog) write(reqs []*request) error {
 		// Increase the file size if we cannot accommodate this entry.
 		// [Aman] Should this be >= or just >? Doesn't make sense to extend the file if it big enough already.
 		if int(endOffset) >= len(curlf.Data) {
+			// 截断
 			if err := curlf.Truncate(int64(endOffset)); err != nil {
 				return err
 			}
 		}
 
 		start := int(endOffset - n)
+		// copy
 		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n))
 
 		curlf.size.Store(endOffset)
@@ -853,40 +896,43 @@ func (vlog *valueLog) write(reqs []*request) error {
 
 	buf := new(bytes.Buffer)
 	for i := range reqs {
-		b := reqs[i]
-		b.Ptrs = b.Ptrs[:0]
+		req := reqs[i]
+		req.Ptrs = req.Ptrs[:0]
 		var written, bytesWritten int
-		valueSizes := make([]int64, 0, len(b.Entries))
-		for j := range b.Entries {
+		valueSizes := make([]int64, 0, len(req.Entries))
+		for j := range req.Entries {
 			buf.Reset()
-
-			e := b.Entries[j]
+			e := req.Entries[j]
 			valueSizes = append(valueSizes, int64(len(e.Value)))
+			// 判断当前 entry.value 是否需要写入 vlog;
 			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
-				b.Ptrs = append(b.Ptrs, valuePointer{})
+				// 写在内存表和.sst文件中;
+				req.Ptrs = append(req.Ptrs, valuePointer{})
 				continue
 			}
+			// 要保存在 .vlog文件中;
 			var p valuePointer
-
 			p.Fid = curlf.fid
 			p.Offset = vlog.woffset()
 
 			// We should not store transaction marks in the vlog file because it will never have all
-			// the entries in a transaction. If we store entries with transaction marks then value
-			// GC will not be able to iterate on the entire vlog file.
-			// But, we still want the entry to stay intact for the memTable WAL. So, store the meta
-			// in a temporary variable and reassign it after writing to the value log.
+			// the entries in a transaction.
+			// If we store entries with transaction marks then value GC will not be able to iterate on the entire vlog file.
+			// But, we still want the entry to stay intact for the memTable WAL.
+			// So, store the meta in a temporary variable and reassign it after writing to the value log.
 			tmpMeta := e.meta
-			e.meta = e.meta &^ (bitTxn | bitFinTxn)
+			e.meta = e.meta &^ (bitTxn | bitFinTxn) // 把事务标记废掉再 & 一下;
+			// <key:ts, value>编码进内存中;
 			plen, err := curlf.encodeEntry(buf, e, p.Offset) // Now encode the entry into buffer.
 			if err != nil {
 				return err
 			}
 			// Restore the meta.
 			e.meta = tmpMeta
+			p.Len = uint32(plen) // valPtr is over.
 
-			p.Len = uint32(plen)
-			b.Ptrs = append(b.Ptrs, p)
+			req.Ptrs = append(req.Ptrs, p)
+			// buf copyTo culFile;
 			if err := write(buf); err != nil {
 				return err
 			}
@@ -894,13 +940,15 @@ func (vlog *valueLog) write(reqs []*request) error {
 			bytesWritten += buf.Len()
 			// No need to flush anything, we write to file directly via mmap.
 		}
+
 		y.NumWritesVlogAdd(vlog.opt.MetricsEnabled, int64(written))
 		y.NumBytesWrittenVlogAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
 
 		vlog.numEntriesWritten += uint32(written)
 		vlog.db.threshold.update(valueSizes)
-		// We write to disk here so that all entries that are part of the same transaction are
-		// written to the same vlog file.
+		// We write to disk here so that all entries that are part of the same transaction are written to the same vlog file.
+		// 每一个 reqs 写一次磁盘;
+		//我们在这里写入磁盘, 以便将属于同一事务的所有条目写入同一个vlog文件;
 		if err := toDisk(); err != nil {
 			return err
 		}
@@ -1005,21 +1053,24 @@ func (vlog *valueLog) pickLog(discardRatio float64) *logFile {
 	defer vlog.filesLock.RUnlock()
 
 LOOP:
-	// Pick a candidate that contains the largest amount of discardable data
+	// Pick a candidate that contains the largest amount of discard table data.
 	fid, discard := vlog.discardStats.MaxDiscard()
 
-	// MaxDiscard will return fid=0 if it doesn't have any discard data. The
-	// vlog files start from 1.
+	// MaxDiscard will return fid=0 if it doesn't have any discard data.
+	// The vlog files start from 1.
 	if fid == 0 {
-		vlog.opt.Debugf("No file with discard stats")
+		vlog.opt.Debugf("No file with discard stats.")
 		return nil
 	}
 	lf, ok := vlog.filesMap[fid]
-	// This file was deleted but it's discard stats increased because of compactions. The file
-	// doesn't exist so we don't need to do anything. Skip it and retry.
+
+	// This file was deleted but it's discard stats increased because of compactions.
+	// 这个文件被删除了, 但是由于合并压缩时不知道;
+	// The file doesn't exist so we don't need to do anything. Skip it and retry.
 	if !ok {
+		// 重新将此id的槽位置为空;
 		vlog.discardStats.Update(fid, -1)
-		goto LOOP
+		goto LOOP // 继续选择其他 vlog 文件;
 	}
 	// We have a valid file.
 	fi, err := lf.Fd.Stat()
@@ -1027,35 +1078,42 @@ LOOP:
 		vlog.opt.Errorf("Unable to get stats for value log fid: %d err: %+v", fi, err)
 		return nil
 	}
+	// 丢弃率小于阈值, 不需要压缩;
 	if thr := discardRatio * float64(fi.Size()); float64(discard) < thr {
-		vlog.opt.Debugf("Discard: %d less than threshold: %.0f for file: %s",
-			discard, thr, fi.Name())
+		vlog.opt.Debugf("Discard: %d less than threshold: %.0f for file: %s", discard, thr, fi.Name())
 		return nil
 	}
+	// 达到丢弃值, 并且不是最后一个 vlog日志文件;
 	if fid < vlog.maxFid {
 		vlog.opt.Infof("Found value log max discard fid: %d discard: %d\n", fid, discard)
 		lf, ok := vlog.filesMap[fid]
 		y.AssertTrue(ok)
 		return lf
 	}
-
+	// 达到丢弃值, 但是是 最后一个 vlog日志文件;
 	// Don't randomly pick any value log file.
 	return nil
 }
 
-func discardEntry(e Entry, vs y.ValueStruct, db *DB) bool {
-	if vs.Version != y.ParseTs(e.Key) {
+func discardEntry(vlogEntry Entry, lsmVS y.ValueStruct, db *DB) bool {
+	// 两者版本不一致; lsmVS.Version 有可能是0;
+	if lsmVS.Version != y.ParseTs(vlogEntry.Key) {
 		// Version not found. Discard.
 		return true
 	}
-	if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+	// lsm 中存储的是 删除墓碑 消息, 那么当前的 vlogEntry 可丢弃;
+	if isDeletedOrExpired(lsmVS.Meta, lsmVS.ExpiresAt) {
 		return true
 	}
-	if (vs.Meta & bitValuePointer) == 0 {
+
+	// 最新的值 不再是 指针类型, 可抛弃;
+	if (lsmVS.Meta & bitValuePointer) == 0 {
 		// Key also stores the value in LSM. Discard.
 		return true
 	}
-	if (vs.Meta & bitFinTxn) > 0 {
+
+	// 会出现这种情况吗?
+	if (lsmVS.Meta & bitFinTxn) > 0 {
 		// Just a txn finish entry. Discard.
 		return true
 	}
@@ -1066,6 +1124,7 @@ func (vlog *valueLog) doRunGC(lf *logFile) error {
 	_, span := otrace.StartSpan(context.Background(), "Badger.GC")
 	span.Annotatef(nil, "GC rewrite for: %v", lf.path)
 	defer span.End()
+	// 直接就开始重写
 	if err := vlog.rewrite(lf); err != nil {
 		return err
 	}
@@ -1075,12 +1134,15 @@ func (vlog *valueLog) doRunGC(lf *logFile) error {
 }
 
 func (vlog *valueLog) waitOnGC(lc *z.Closer) {
+	// 不继续等待 vlogGC 完毕吗? 仅仅是禁止新 GC启动;
 	defer lc.Done()
 
+	// 说明 被调用 关闭;
 	<-lc.HasBeenClosed() // Wait for lc to be closed.
 
 	// Block any GC in progress to finish, and don't allow any more writes to runGC by filling up
 	// the channel of size 1.
+	// 装满通道, 禁止vlogGC再启动;
 	vlog.garbageCh <- struct{}{}
 }
 
@@ -1091,9 +1153,13 @@ func (vlog *valueLog) runGC(discardRatio float64) error {
 		defer func() {
 			<-vlog.garbageCh
 		}()
-
+		//  寻找 .vlogFile;
 		lf := vlog.pickLog(discardRatio)
 		if lf == nil {
+			// 1. 选取的文件是 0号
+			// 2. 选取的文件是 max号
+			// 3. 选取的文件 没有达到丢弃值
+			// 3. 选取的文件 获得其信息时,报错
 			return ErrNoRewrite
 		}
 		return vlog.doRunGC(lf)

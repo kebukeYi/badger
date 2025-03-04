@@ -24,7 +24,7 @@ import (
 )
 
 func TestDiscardStats(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestDiscardStats-")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -54,7 +54,7 @@ func TestDiscardStats(t *testing.T) {
 }
 
 func TestReloadDiscardStats(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestReloadDiscardStats-")
 	require.NoError(t, err)
 	defer removeDir(dir)
 

@@ -32,6 +32,7 @@ import (
 type discardStats struct {
 	sync.Mutex
 
+	//[<fid-8B,size-8B>,<fid,size>,<fid,size>,<fid,size>]
 	*z.MmapFile
 	opt           Options
 	nextEmptySlot int
@@ -43,6 +44,7 @@ func InitDiscardStats(opt Options) (*discardStats, error) {
 	fname := filepath.Join(opt.ValueDir, discardFname)
 
 	// 1MB file can store 65.536 discard entries. Each entry is 16 bytes.
+	// 1048576 B = 1MB
 	mf, err := z.OpenMmapFile(fname, os.O_CREATE|os.O_RDWR, 1<<20)
 	lf := &discardStats{
 		MmapFile: mf,
@@ -54,10 +56,11 @@ func InitDiscardStats(opt Options) (*discardStats, error) {
 	} else if err != nil {
 		return nil, y.Wrapf(err, "while opening file: %s\n", discardFname)
 	}
-
-	for slot := 0; slot < lf.maxSlot(); slot++ {
-		if lf.get(16*slot) == 0 {
-			lf.nextEmptySlot = slot
+	// 初始化槽位;
+	for slotID := 0; slotID < lf.maxSlot(); slotID++ {
+		offset := 16 * slotID
+		if lf.get(offset) == 0 {
+			lf.nextEmptySlot = slotID
 			break
 		}
 	}
@@ -99,9 +102,9 @@ func (lf *discardStats) maxSlot() int {
 	return len(lf.Data) / 16
 }
 
-// Update would update the discard stats for the given file id. If discard is
-// 0, it would return the current value of discard for the file. If discard is
-// < 0, it would set the current value of discard to zero for the file.
+// Update would update the discard stats for the given file id.
+// If discard is 0, it would return the current value of discard for the file.
+// If discard is < 0, it would set the current value of discard to zero for the file.
 func (lf *discardStats) Update(fidu uint32, discard int64) int64 {
 	fid := uint64(fidu)
 	lf.Lock()
@@ -114,13 +117,15 @@ func (lf *discardStats) Update(fidu uint32, discard int64) int64 {
 	if idx < lf.nextEmptySlot && lf.get(idx*16) == fid {
 		off := idx*16 + 8
 		curDisc := lf.get(off)
+		//
 		if discard == 0 {
 			return int64(curDisc)
 		}
-		if discard < 0 {
+		if discard < 0 { // 重新设置;
 			lf.set(off, 0)
 			return 0
 		}
+		// 更新
 		lf.set(off, curDisc+uint64(discard))
 		return int64(curDisc + uint64(discard))
 	}

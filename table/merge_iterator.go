@@ -18,7 +18,6 @@ package table
 
 import (
 	"bytes"
-
 	"github.com/dgraph-io/badger/v4/y"
 )
 
@@ -155,13 +154,14 @@ func (mi *MergeIterator) swapSmall() {
 // Next returns the next element. If it is the same as the current key, ignore it.
 func (mi *MergeIterator) Next() {
 	for mi.Valid() {
-		// 什么情况下会相同呢?
+		// 什么情况下会相同呢? 当前返回的curKey 和small 所指向的key相同;
 		if !bytes.Equal(mi.small.key, mi.curKey) {
 			break
 		}
 		mi.small.next()
 		mi.fix()
 	}
+	//
 	mi.setCurrent()
 }
 

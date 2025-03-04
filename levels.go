@@ -622,12 +622,13 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 
 // checkOverlap checks if the given tables overlap with any level from the given "lev" onwards.
 func (s *levelsController) checkOverlap(tables []*table.Table, lev int) bool {
-	kr := getKeyRange(tables...)
+	kr := getKeyRange(tables...) // 给定的 table 区间
 	for i, lh := range s.levels {
-		if i < lev { // Skip upper levels.
+		if i < lev { // Skip upper levels.  跳过 低于本层的;
 			continue
 		}
 		lh.RLock()
+		// 判断当前 level 是否存在区间;
 		left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
 		lh.RUnlock()
 		if right-left > 0 {
@@ -649,7 +650,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 	// Check overlap of the top level with the levels which are not being
 	// compacted in this compaction.
-	// 存在 大量重叠区间
+	// 从 cd.nextLevel.level+1层的表 开始判断本次合并涉及到的表, 是否和其存在重叠区间;
+	// 存在的话, 那就不能轻易删除数据,比如 delete 类型数据;
 	hasOverlap := s.checkOverlap(cd.allTables(), cd.nextLevel.level+1)
 
 	// Pick a discard ts, so we can discard versions below this ts. We should
@@ -799,7 +801,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				// - We've already processed `NumVersionsToKeep` number of versions
 				// (including the current item being processed)包括现在正在遍历的;
 				lastValidVersion := vs.Meta&bitDiscardEarlierVersions > 0 ||
-					numVersions == s.kv.opt.NumVersionsToKeep // 默认是1
+					numVersions == s.kv.opt.NumVersionsToKeep // 默认是1;
 
 				// 过期,删除类型 || 最后一个有效版本的key了, 后续遍历到的可丢弃掉了; 并且会通知 vlog;
 				if isExpired || lastValidVersion {
@@ -814,18 +816,18 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 					// Add the key to the table only if it has not expired.
 					// We don't want to add the deleted/expired keys.
 					case !isExpired && lastValidVersion:
-						// 不是删除版本 && 但是key版本保留够了,不用管,等待下一轮跳过即可;
+						// 不是删除版本 && 但是key版本刚刚够了,当前key不用删除, 把下一个的key清除即可;
 						// Add this key. We have set skipKey, so the following key versions
 						// would be skipped.
 					case hasOverlap:
-						// 是删除版本 || 但是key版本保留可够也可不够 && 重叠区间太多;
-						// 不能轻易把 删除标记给清理掉;
+						// 是删除版本 || (但是key版本保留可够也可不够 && 重叠区间太多);
+						// 但是存在重叠区间, 因此不能轻易把 删除标记给清理掉,但是后续遍历到的低版本可skip;
 						// If this key range has overlap with lower levels, then keep the deletion
 						// marker with the latest version, discarding the rest.
 						// 如果此键范围与较低级别重叠, 则保留最新版本的删除标记, 丢弃其余部分;
 						// We have set skipKey, so the following key versions would be skipped.
 					default:
-						// 是删除版本 || 但是key版本保留可够也可不够 && 重叠区间不多;
+						// 没有出现重复 || 当前key是删除类型 || (但是key版本保留可够也可不够 && 重叠区间不多);
 						// If no overlap, we can skip all the versions, by continuing here.
 						numSkips++
 						updateStats(vs) // todo 更新 vlogFile 统计信息;
@@ -846,12 +848,15 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				// 这个键与最后一个设置了“DiscardEarlierVersions”的键相同;
 				// The next compactions will drop this key if its ts > discardTs (of the next compaction).
 				builder.AddStaleKey(it.Key(), vs, vp.Len) // 本次保留, 下一次就会被删除掉;
+				fmt.Printf("compact:firstKeyHasDiscardSet:key: %s, skipKey:%s \n", it.Key(), skipKey)
 			case isExpired:
 				// If the key is expired, the next compaction will drop it if its ts > discardTs (of the next compaction).
 				builder.AddStaleKey(it.Key(), vs, vp.Len) // 本次保留, 下一次就会被删除掉;
+				fmt.Printf("compact:isExpired:key: %s, skipKey:%s \n", it.Key(), skipKey)
 			default:
 				// 正常数据;
 				builder.Add(it.Key(), vs, vp.Len)
+				fmt.Printf("compact:normal:key: %s, skipKey:%s \n", it.Key(), skipKey)
 			}
 		} // for over...
 
@@ -1478,6 +1483,7 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	} else {
 		s.addSplits(&cd)
 	}
+
 	if len(cd.splits) == 0 {
 		cd.splits = append(cd.splits, keyRange{})
 	}
@@ -1632,6 +1638,7 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 		}
 	}
 
+	// for 循环一直循环，直到添加成功，否则一直等待;
 	for !s.levels[0].tryAddLevel0Table(t) {
 		// Before we unstall, we need to make sure that level 0 is healthy.
 		timeStart := time.Now()

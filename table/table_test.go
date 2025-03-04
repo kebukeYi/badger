@@ -504,9 +504,11 @@ func TestMergingIterator(t *testing.T) {
 	defer it.Close()
 
 	var i int
-	for it.Rewind(); it.Valid(); it.Next() {
+	it.Rewind()
+	for ; it.Valid(); it.Next() {
 		k := it.Key()
 		vs := it.Value()
+		fmt.Printf("key: %v, value: %v\n", string(y.ParseKey(k)), string(vs.Value))
 		require.EqualValues(t, expected[i].key, string(y.ParseKey(k)))
 		require.EqualValues(t, expected[i].value, string(vs.Value))
 		require.EqualValues(t, 'A', vs.Meta)

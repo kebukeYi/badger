@@ -395,14 +395,13 @@ func (s *Skiplist) Get(keyMaxReadTs []byte) y.ValueStruct {
 
 	nextKey := s.arena.getKey(n.keyOffset, n.keySize)
 	// 注意: 此时的 nextKey, 可能和原生key相同,但是版本不同;
-	// 仅仅比较原生key是否相同;
 	if !y.SameKey(keyMaxReadTs, nextKey) {
 		return y.ValueStruct{}
 	}
 
 	valOffset, valSize := n.getValueOffset()
 	vs := s.arena.getVal(valOffset, valSize)
-	// 解析出 正常递增的版本号;
+	// todo 解析出 内部正常递增的版本号;
 	vs.Version = y.ParseTs(nextKey)
 	return vs
 }

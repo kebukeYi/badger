@@ -102,9 +102,7 @@ func (s *levelHandler) getSummary(sum *summary) {
 func (s *DB) validate() error { return s.lc.validate() }
 
 func getTestOptions(dir string) Options {
-	opt := DefaultOptions(dir).
-		WithSyncWrites(false).
-		WithLoggingLevel(WARNING)
+	opt := DefaultOptions(dir).WithSyncWrites(false).WithLoggingLevel(WARNING)
 	return opt
 }
 
@@ -144,18 +142,22 @@ func txnDelete(t *testing.T, kv *DB, key []byte) {
 
 // Opens a badger db and runs a a test on it.
 func runBadgerTest(t *testing.T, opts *Options, test func(t *testing.T, db *DB)) {
-	// C:\Users\19327\AppData\Local\Temp\badger-test2227593501
-	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-")
-	require.NoError(t, err)
-	defer removeDir(dir)
 	if opts == nil {
 		opts = new(Options)
-		*opts = getTestOptions(dir)
-	} else {
+		*opts = getTestOptions("")
+	}
+	var err error
+	var dir string
+	if opts.Dir == "" {
+		dir, err = os.MkdirTemp("F:\\ProjectsData\\golang\\TrainBadger\\test\\db", "runBadgerTest-")
 		opts.Dir = dir
 		opts.ValueDir = dir
+		defer removeDir(dir)
+	} else {
+		dir = opts.Dir
+		clearDir(dir)
 	}
-
+	require.NoError(t, err)
 	if opts.InMemory {
 		opts.Dir = ""
 		opts.ValueDir = ""
@@ -209,6 +211,14 @@ func TestReverseIterator(t *testing.T) {
 func TestWrite(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 		for i := 0; i < 100; i++ {
+			txnSet(t, db, []byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), 0x00)
+		}
+	})
+}
+
+func BenchmarkTxn_Set(b *testing.B) {
+	runBadgerTest(nil, nil, func(t *testing.T, db *DB) {
+		for i := 0; i < b.N; i++ {
 			txnSet(t, db, []byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), 0x00)
 		}
 	})
@@ -434,7 +444,7 @@ func TestTxnTooBig(t *testing.T) {
 }
 
 func TestForceCompactL0(t *testing.T) {
-	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestForceCompactL0")
+	dir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test-TestForceCompactL0")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -483,7 +493,7 @@ func TestStreamDB(t *testing.T) {
 		}
 	}
 
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test-TestStreamDB-")
 	require.NoError(t, err)
 	defer removeDir(dir)
 	opts := getTestOptions(dir).
@@ -505,7 +515,7 @@ func TestStreamDB(t *testing.T) {
 	require.NoError(t, writer.Flush())
 	check(db)
 
-	outDir, err := os.MkdirTemp("", "badger-test")
+	outDir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test-")
 	require.NoError(t, err)
 	outOpt := getTestOptions(outDir)
 	require.NoError(t, db.StreamDB(outOpt))
@@ -546,7 +556,7 @@ func dirSize(path string) (int64, error) {
 // Also with PR #1303, the delete keys are properly cleaned which
 // further reduces disk size.
 func BenchmarkDbGrowth(b *testing.B) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test")
 	require.NoError(b, err)
 	defer removeDir(dir)
 
@@ -863,11 +873,13 @@ func TestIterate2Basic(t *testing.T) {
 		}
 		it.Close()
 	}
+
 	t.Run("disk mode", func(t *testing.T) {
 		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 			test(t, db)
 		})
 	})
+
 	t.Run("InMemory mode", func(t *testing.T) {
 		opt := DefaultOptions("").WithInMemory(true)
 		db, err := Open(opt)
@@ -880,7 +892,7 @@ func TestIterate2Basic(t *testing.T) {
 
 func TestLoad(t *testing.T) {
 	testLoad := func(t *testing.T, opt Options) {
-		dir, err := os.MkdirTemp("", "badger-test")
+		dir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test")
 		require.NoError(t, err)
 		defer removeDir(dir)
 		opt.Dir = dir
@@ -1850,8 +1862,12 @@ func TestReadOnly(t *testing.T) {
 }
 
 func TestLSMOnly(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
-	require.NoError(t, err)
+	//dir, err := os.MkdirTemp("", "badger-test")
+	//require.NoError(t, err)
+	var err error
+	dir := "F:\\F:\\ProjectsData\\golang\\TrainBadger\\test\\lsm" // ok
+	//dir := "F:\\TrainDB\\test\\dbtest" // ok
+	clearDir(dir)
 	defer removeDir(dir)
 
 	opts := LSMOnlyOptions(dir)
@@ -2296,6 +2312,14 @@ func removeDir(dir string) {
 	if err := os.RemoveAll(dir); err != nil {
 		panic(err)
 	}
+}
+
+func clearDir(dir string) error {
+	if err := os.RemoveAll(dir); err != nil {
+		panic(err)
+	}
+	os.MkdirAll(dir, os.ModePerm)
+	return nil
 }
 
 func TestWriteInemory(t *testing.T) {

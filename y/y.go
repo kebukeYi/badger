@@ -207,8 +207,11 @@ type Throttle struct {
 // NewThrottle creates a new throttle with a max number of workers.
 func NewThrottle(max int) *Throttle {
 	return &Throttle{
-		ch:    make(chan struct{}, max),
-		errCh: make(chan error, max),
+		once:      sync.Once{},
+		wg:        sync.WaitGroup{},
+		ch:        make(chan struct{}, max),
+		errCh:     make(chan error, max),
+		finishErr: nil,
 	}
 }
 
@@ -246,9 +249,11 @@ func (t *Throttle) Done(err error) {
 // Finish waits until all workers have finished working. It would return any error passed by Done.
 // If Finish is called multiple time, it will wait for workers to finish only once(first time).
 // From next calls, it will return same error as found on first call.
-func (t *Throttle) Finish() error {
+func (t *Throttle) Finish(from string) error {
 	t.once.Do(func() {
+		fmt.Printf("#Throttle.Finish( %s ): Waiting for workers to finish.\n", from)
 		t.wg.Wait()
+		fmt.Printf("#Throttle.Finish( %s ): Waiting for workers is sinling.\n", from)
 		close(t.ch)
 		close(t.errCh)
 		for err := range t.errCh {
@@ -258,7 +263,6 @@ func (t *Throttle) Finish() error {
 			}
 		}
 	})
-
 	return t.finishErr
 }
 

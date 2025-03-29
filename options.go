@@ -157,7 +157,7 @@ func DefaultOptions(path string) Options {
 		BloomFalsePositive:      0.01,
 		BlockSize:               4 * 1024,
 		SyncWrites:              false,
-		NumVersionsToKeep:       1, //
+		NumVersionsToKeep:       1,
 		CompactL0OnClose:        false,
 		VerifyValueChecksum:     false,
 		Compression:             options.Snappy,

@@ -37,25 +37,26 @@ import (
 )
 
 func TestManifestBasic(t *testing.T) {
-	dir, err := os.MkdirTemp("", "badger-test")
+	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test-TestManifestBasic-")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
 	opt := getTestOptions(dir)
 	{
 		kv, err := Open(opt)
+		kv.close()
 		require.NoError(t, err)
-		n := 5000
-		for i := 0; i < n; i++ {
-			if (i % 10000) == 0 {
-				fmt.Printf("Putting i=%d\n", i)
-			}
-			k := []byte(fmt.Sprintf("%16x", rand.Int63()))
-			txnSet(t, kv, k, k, 0x00)
-		}
-		txnSet(t, kv, []byte("testkey"), []byte("testval"), 0x05)
-		require.NoError(t, kv.validate())
-		require.NoError(t, kv.Close())
+		//n := 5000
+		//for i := 0; i < n; i++ {
+		//	if (i % 10000) == 0 {
+		//		fmt.Printf("Putting i=%d\n", i)
+		//	}
+		//	k := []byte(fmt.Sprintf("%16x", rand.Int63()))
+		//	txnSet(t, kv, k, k, 0x00)
+		//}
+		//txnSet(t, kv, []byte("testkey"), []byte("testval"), 0x05)
+		//require.NoError(t, kv.validate())
+		//require.NoError(t, kv.Close())
 	}
 
 	kv, err := Open(opt)

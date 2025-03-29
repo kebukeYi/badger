@@ -299,7 +299,7 @@ func (sw *StreamWriter) Flush() error {
 	}
 
 	// Wait for all files to be written.
-	if err := sw.throttle.Finish(); err != nil {
+	if err := sw.throttle.Finish("StreamWriter.Flush"); err != nil {
 		return err
 	}
 
@@ -338,7 +338,7 @@ func (sw *StreamWriter) Cancel() {
 		}
 	}
 
-	if err := sw.throttle.Finish(); err != nil {
+	if err := sw.throttle.Finish("StreamWriter.Cancel"); err != nil {
 		sw.db.opt.Errorf("error in throttle.Finish: %+v", err)
 	}
 

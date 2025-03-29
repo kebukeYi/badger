@@ -231,7 +231,7 @@ func (l *KVLoader) Finish() error {
 			return err
 		}
 	}
-	return l.throttle.Finish()
+	return l.throttle.Finish("KVLoader.Finish")
 }
 
 // Load reads a protobuf-encoded list of all entries from a reader and writes

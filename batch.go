@@ -80,7 +80,7 @@ func (wb *WriteBatch) Cancel() {
 	wb.Lock()
 	defer wb.Unlock()
 	wb.finished = true
-	if err := wb.throttle.Finish(); err != nil {
+	if err := wb.throttle.Finish("WriteBatch.Cancel"); err != nil {
 		wb.db.opt.Errorf("WatchBatch.Cancel error while finishing: %v", err)
 	}
 	wb.txn.Discard()
@@ -229,7 +229,7 @@ func (wb *WriteBatch) Flush() error {
 	wb.txn.Discard()
 	wb.Unlock()
 
-	if err := wb.throttle.Finish(); err != nil {
+	if err := wb.throttle.Finish("WriteBatch.Flush"); err != nil {
 		if wb.Error() != nil {
 			return errors.Errorf("wb.err: %s err: %s", wb.Error(), err)
 		}

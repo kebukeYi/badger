@@ -344,11 +344,12 @@ func Open(opt Options) (*DB, error) {
 	db.closers.updateSize = z.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
 
-	// 更新内存表;
+	// wal更新内存表;
 	if err := db.openMemTables(db.opt); err != nil {
 		return nil, y.Wrapf(err, "while opening memtables")
 	}
 
+	// 新建memtable
 	if !db.opt.ReadOnly {
 		if db.mt, err = db.newMemTable(); err != nil {
 			return nil, y.Wrapf(err, "cannot create memtable")
@@ -1002,9 +1003,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 	y.PendingWritesSet(db.opt.MetricsEnabled, db.opt.Dir, reqLen)
 	reqs := make([]*request, 0, 10)
 	for { // readCase   closedCase   writeCase
-
 		var r *request
-
 		select {
 		// 1. txN.commit() 会将内存中的数据 发送到此通道中;
 		// 2. vlog.db.batchSet(wb);
@@ -1103,7 +1102,7 @@ func (db *DB) ensureRoomForWrite() error {
 	}
 
 	select {
-	case db.flushChan <- db.mt:
+	case db.flushChan <- db.mt: // 加锁后,这里出现阻塞怎么办?
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n", db.mt.sl.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
 		db.imm = append(db.imm, db.mt)
@@ -1185,14 +1184,12 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 // are errors during handling the memtable flush, we'll retry indefinitely.
 func (db *DB) flushMemtable(lc *z.Closer) {
 	defer lc.Done()
-
 	// 当db.stopMemoryFlush() 被调用时,当前for{}会立即结束;
 	// 并且没有数据可读,等待通道中有数据到来;
 	for mt := range db.flushChan {
 		if mt == nil {
 			continue
 		}
-
 		for {
 			// 处理刷盘, tableBuilder;
 			if err := db.handleMemTableFlush(mt, nil); err != nil {
@@ -1201,7 +1198,6 @@ func (db *DB) flushMemtable(lc *z.Closer) {
 				time.Sleep(time.Second)
 				continue
 			}
-
 			// Update s.imm. Need a lock.
 			db.lock.Lock()
 			// This is a single-threaded operation. mt corresponds to the head of

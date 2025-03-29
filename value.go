@@ -879,8 +879,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 	}
 
 	toDisk := func() error {
-		if vlog.woffset() > uint32(vlog.opt.ValueLogFileSize) ||
-			vlog.numEntriesWritten > vlog.opt.ValueLogMaxEntries {
+		if vlog.woffset() > uint32(vlog.opt.ValueLogFileSize) || vlog.numEntriesWritten > vlog.opt.ValueLogMaxEntries {
 			if err := curlf.doneWriting(vlog.woffset()); err != nil {
 				return err
 			}
@@ -900,7 +899,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		req.Ptrs = req.Ptrs[:0]
 		var written, bytesWritten int
 		valueSizes := make([]int64, 0, len(req.Entries))
-		for j := range req.Entries {
+		for j := range req.Entries { // 尽量把 在同一个 req中的数据都写在同一个 vlogFile中;
 			buf.Reset()
 			e := req.Entries[j]
 			valueSizes = append(valueSizes, int64(len(e.Value)))
@@ -947,8 +946,8 @@ func (vlog *valueLog) write(reqs []*request) error {
 		vlog.numEntriesWritten += uint32(written)
 		vlog.db.threshold.update(valueSizes)
 		// We write to disk here so that all entries that are part of the same transaction are written to the same vlog file.
-		// 每一个 reqs 写一次磁盘;
-		//我们在这里写入磁盘, 以便将属于同一事务的所有条目写入同一个vlog文件;
+		// 每一个 req 写一次磁盘;
+		// 我们在这里写入磁盘, 以便将属于同一事务的所有条目写入同一个vlog文件;
 		if err := toDisk(); err != nil {
 			return err
 		}

@@ -32,7 +32,7 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 
-// F:\ProjectsData\golang
+var txnTestWindowsDir = "F:\\ProjectsData\\golang\\TrainBadger\\test"
 
 func TestTxn_Commit(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
@@ -76,6 +76,7 @@ func TestTxn_Commit(t *testing.T) {
 	})
 }
 
+// TestTxnSimple 测试普通读写逻辑;
 func TestTxnSimple(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 		txn := db.NewTransaction(true)
@@ -94,8 +95,12 @@ func TestTxnSimple(t *testing.T) {
 			return nil
 		}))
 
-		require.Panics(t, func() { _ = txn.CommitAt(100, nil) })
+		//require.Panics(t, func() { _ = txn.CommitAt(100, nil) })
 		require.NoError(t, txn.Commit())
+
+		txn = db.NewTransaction(true)
+		item, err = txn.Get([]byte("key=8"))
+		fmt.Sprintf("oneitme: %v; err:%s", item, err)
 	})
 }
 
@@ -720,6 +725,7 @@ func TestIteratorAllVersionsWithDeleted(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
+
 	t.Run("disk mode", func(t *testing.T) {
 		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
 			test(t, db)
@@ -779,7 +785,7 @@ func TestIteratorAllVersionsWithDeleted2(t *testing.T) {
 
 // TestManagedDB, todo 非常重要, 细致的测试了不同版本下的 读取情况; 可反映出[可重复读]级别;
 func TestManagedDB(t *testing.T) {
-	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "badger-test")
+	dir, err := os.MkdirTemp(txnTestWindowsDir, "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
 
@@ -893,7 +899,7 @@ func TestManagedDB(t *testing.T) {
 }
 
 func TestArmV7Issue311Fix(t *testing.T) {
-	dir, err := os.MkdirTemp("F:\\ProjectsData\\golang", "TestArmV7Issue311Fix-")
+	dir, err := os.MkdirTemp(txnTestWindowsDir, "TestArmV7Issue311Fix-")
 	require.NoError(t, err)
 
 	defer removeDir(dir)

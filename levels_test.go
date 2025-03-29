@@ -173,8 +173,10 @@ func getAllAndCheck(t *testing.T, db *DB, expected []keyValVersion) {
 }
 
 func TestCompaction(t *testing.T) {
+	//path := "/usr/projects_gen_data/goprogendata/badgerdata/test/compact"
+	path := "F:\\ProjectsData\\golang\\test\\compact"
 	// Disable compactions and keep single version of each key.
-	opt := DefaultOptions("").WithNumCompactors(0).WithNumVersionsToKeep(1)
+	opt := DefaultOptions(path).WithNumCompactors(0).WithNumVersionsToKeep(1)
 	opt.managedTxns = true
 
 	t.Run("level 0 to level 1", func(t *testing.T) {
@@ -208,7 +210,7 @@ func TestCompaction(t *testing.T) {
 				nextLevel: db.lc.levels[1],
 				top:       db.lc.levels[0].tables,
 				bot:       db.lc.levels[1].tables,
-				t:         db.lc.levelTargets(),
+				t:         db.lc.levelTargets(), // 计算的 baseLevel 会直接到6层;
 			}
 			cdef.t.baseLevel = 1
 			require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))

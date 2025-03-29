@@ -131,7 +131,6 @@ func openOrCreateManifestFile(opt Options) (
 	if opt.InMemory {
 		return &manifestFile{inMemory: true}, Manifest{}, nil
 	}
-	//
 	return helpOpenOrCreateManifestFile(opt.Dir, opt.ReadOnly, opt.ExternalMagicVersion,
 		manifestDeletionsRewriteThreshold)
 }
@@ -153,9 +152,7 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, extMagic uint16,
 		if readOnly {
 			return nil, Manifest{}, fmt.Errorf("no manifest found, required for read-only db")
 		}
-		//
 		m := createManifest()
-		//
 		fp, netCreations, err := helpRewrite(dir, &m, extMagic)
 		if err != nil {
 			return nil, Manifest{}, err
@@ -284,7 +281,8 @@ func helpRewrite(dir string, m *Manifest, extMagic uint16) (*os.File, int, error
 	}
 	var lenCrcBuf [8]byte
 	binary.BigEndian.PutUint32(lenCrcBuf[0:4], uint32(len(changeBuf)))
-	binary.BigEndian.PutUint32(lenCrcBuf[4:8], crc32.Checksum(changeBuf, y.CastagnoliCrcTable))
+	checksum := crc32.Checksum(changeBuf, y.CastagnoliCrcTable)
+	binary.BigEndian.PutUint32(lenCrcBuf[4:8], checksum)
 	buf = append(buf, lenCrcBuf[:]...)
 	buf = append(buf, changeBuf...)
 	if _, err := fp.Write(buf); err != nil {
@@ -414,8 +412,7 @@ func ReplayManifestFile(fp *os.File, extMagic uint16) (Manifest, int64, error) {
 		// Sanity check to ensure we don't over-allocate memory.
 		if length > uint32(stat.Size()) {
 			return Manifest{}, 0, errors.Errorf(
-				"Buffer length: %d greater than file size: %d. Manifest file might be corrupted",
-				length, stat.Size())
+				"Buffer length: %d greater than file size: %d. Manifest file might be corrupted", length, stat.Size())
 		}
 		var buf = make([]byte, length)
 		if _, err := io.ReadFull(&r, buf); err != nil {
@@ -424,7 +421,9 @@ func ReplayManifestFile(fp *os.File, extMagic uint16) (Manifest, int64, error) {
 			}
 			return Manifest{}, 0, err
 		}
-		if crc32.Checksum(buf, y.CastagnoliCrcTable) != y.BytesToU32(lenCrcBuf[4:8]) {
+		checksum := crc32.Checksum(buf, y.CastagnoliCrcTable)
+		bytesToU32 := y.BytesToU32(lenCrcBuf[4:8])
+		if checksum != bytesToU32 {
 			return Manifest{}, 0, errBadChecksum
 		}
 

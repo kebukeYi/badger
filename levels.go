@@ -92,6 +92,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 	if db.opt.InMemory {
 		return s, nil
 	}
+
 	// Compare manifest against directory, check for existent/non-existent files, and remove.
 	if err := revertToManifest(db, mf, getIDMap(db.opt.Dir)); err != nil {
 		return nil, err
@@ -164,7 +165,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 		}(fname, tf)
 	}
 	//
-	if err := throttle.Finish(); err != nil {
+	if err := throttle.Finish("newLevelsController"); err != nil {
 		closeAllTables(tables)
 		return nil, err
 	}
@@ -622,7 +623,7 @@ func (s *levelsController) pickCompactLevels(priosBuffer []compactionPriority) (
 
 // checkOverlap checks if the given tables overlap with any level from the given "lev" onwards.
 func (s *levelsController) checkOverlap(tables []*table.Table, lev int) bool {
-	kr := getKeyRange(tables...) // 给定的 table 区间
+	kr := getKeyRange(tables...) // 获得给定的 table 区间里面,最大最小值的所有版本区间'
 	for i, lh := range s.levels {
 		if i < lev { // Skip upper levels.  跳过 低于本层的;
 			continue
@@ -716,14 +717,14 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			// See if we need to skip this key.
 			// 1. 上一个是删除类型消息, 那么之后的key就可以跳过了;
 			// 2. 上一个键已经达到默认key版本保留数量, 剩余的key也可以跳过了;
-			if len(skipKey) > 0 {
+			if len(skipKey) > 0 { // 如果其有值, 就说明 当前key是需要进行剔除的了;
 				// 不记版本, 直接跳过 原生key相同的;
 				if y.SameKey(it.Key(), skipKey) {
 					numSkips++
 					updateStats(it.Value())
 					continue
 				} else {
-					skipKey = skipKey[:0]
+					skipKey = skipKey[:0] // 出现另外一个 新key, 于是重新赋值;
 				}
 			}
 
@@ -862,7 +863,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 		s.kv.opt.Debugf("[%d] LOG Compact. Added %d keys. Skipped %d keys. Iteration took: %v",
 			cd.compactorId, numKeys, numSkips, time.Since(timeStart).Round(time.Millisecond))
-	} // End of function: addKeys()
+	} // End addKeys()
 
 	if len(kr.left) > 0 {
 		// 归并迭代器 定位到区间的开始;
@@ -870,6 +871,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	} else {
 		it.Rewind()
 	}
+
 	for it.Valid() {
 		// 如果存在 右区间 && 当前key > 右区间, 说明遍历到头, 跳出循环;
 		if len(kr.right) > 0 && y.CompareKeys(it.Key(), kr.right) >= 0 {
@@ -892,8 +894,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			builder.Close()
 			continue
 		}
-
 		numBuilds++
+
 		if err := inflightBuilders.Do(); err != nil {
 			// Can't return from here, until I decrRef all the tables that I built so far.
 			break
@@ -919,7 +921,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			}
 			res <- tbl
 		}(builder, s.reserveFileID())
-	}
+	} // for over
+
 	// 向vlog发送统计的失效数据;
 	s.kv.vlog.updateDiscardStats(discardStats)
 	s.kv.opt.Debugf("Discard stats: %v", discardStats)
@@ -973,6 +976,7 @@ func (s *levelsController) compactBuildTables(
 	}
 
 	res := make(chan *table.Table, 3)
+
 	inflightBuilders := y.NewThrottle(8 + len(cd.splits))
 	for _, kr := range cd.splits {
 		// Initiate Do here so we can register the goroutines for buildTables too.
@@ -992,6 +996,7 @@ func (s *levelsController) compactBuildTables(
 	var newTables []*table.Table
 	var wg sync.WaitGroup
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
 		for t := range res {
@@ -1000,7 +1005,7 @@ func (s *levelsController) compactBuildTables(
 	}()
 
 	// Wait for all table builders to finish and also for newTables accumulator to finish.
-	err := inflightBuilders.Finish()
+	err := inflightBuilders.Finish("compactBuildTables")
 	close(res)
 	wg.Wait() // Wait for all tables to be picked up.
 
@@ -1470,7 +1475,7 @@ func (s *levelsController) fillTables(cd *compactDef) bool {
 
 func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	if len(cd.t.fileSz) == 0 {
-		return errors.New("Filesizes cannot be zero. Targets are not set")
+		return errors.New("File Size cannot be zero. Targets are not set.")
 	}
 	timeStart := time.Now()
 
@@ -1662,8 +1667,7 @@ func (s *levelsController) close() error {
 // get searches for a given key in all the levels of the LSM tree. It returns
 // key version <= the expected version (version in key). If not found,
 // it returns an empty y.ValueStruct.
-func (s *levelsController) get(keyReadTs []byte, maxVs y.ValueStruct, startLevel int) (
-	y.ValueStruct, error) {
+func (s *levelsController) get(keyReadTs []byte, maxVs y.ValueStruct, startLevel int) (y.ValueStruct, error) {
 	if s.kv.IsClosed() {
 		return y.ValueStruct{}, ErrDBClosed
 	}

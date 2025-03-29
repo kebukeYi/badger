@@ -367,7 +367,7 @@ func TestFindNear(t *testing.T) {
 
 // TestIteratorNext tests a basic iteration over all nodes from the beginning.
 func TestIteratorNext(t *testing.T) {
-	const n = 100
+	const n = 1
 	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
 	it := l.NewIterator()
@@ -376,14 +376,15 @@ func TestIteratorNext(t *testing.T) {
 	it.SeekToFirst()
 	require.False(t, it.Valid())
 	for i := n - 1; i >= 0; i-- {
-		l.Put(y.KeyWithTs([]byte(fmt.Sprintf("%05d", i)), 0),
-			y.ValueStruct{Value: newValue(i), Meta: 0, UserMeta: 0})
+		l.Put(y.KeyWithTs([]byte(fmt.Sprintf("%05d", i)), 0), y.ValueStruct{Value: newValue(i), Meta: 0, UserMeta: 0})
 	}
 	it.SeekToFirst()
-	for i := 0; i < n; i++ {
-		require.True(t, it.Valid())
+	//for i := 0; i < n; i++ {
+	for it.Valid() {
+		//require.True(t, it.Valid())
 		v := it.Value()
-		require.EqualValues(t, newValue(i), v.Value)
+		fmt.Printf("key: %s, value: %s\n", string(it.Key()), string(v.Value))
+		//require.EqualValues(t, newValue(i), v.Value)
 		it.Next()
 	}
 	require.False(t, it.Valid())

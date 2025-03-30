@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-//var benchMarkDir = "F:\\ProjectsData\\golang\\TrainBadger\\test\\benchmk"
+var benchMarkDir = "F:\\ProjectsData\\golang\\TrainBadger\\test\\benchmk"
 
-var benchMarkDir = "/usr/projects/golangprojects/badger/benchmk"
+//var benchMarkDir = "/usr/projects/golangprojects/badger/benchmk"
 
 var benchMarkOpt = badger.Options{
 	Dir:      benchMarkDir,
@@ -61,8 +61,8 @@ func BenchmarkTxnSet(b *testing.B) {
 	clearDir(benchMarkDir)
 	// -count=2 -benchtime=3s -failfast -benchmem
 	// -count=5 -benchtime=100000x  -benchmem  -failfast
-	//db, err := badger.Open(benchMarkOpt)
-	db, err := badger.Open(badger.DefaultOptions(benchMarkDir))
+	db, err := badger.Open(benchMarkOpt)
+	//db, err := badger.Open(badger.DefaultOptions(benchMarkDir))
 	defer db.Close()
 	if err != nil {
 		fmt.Printf("open badger failed, err:%v\n", err)
@@ -70,9 +70,9 @@ func BenchmarkTxnSet(b *testing.B) {
 	}
 	for i := 0; i < b.N; i++ {
 		key := []byte(fmt.Sprintf("key=%d", i))
-		//valSize := 127 + 1
+		valSize := 127 + 1
 		//valSize := 10<<20 + 1
-		valSize := 64<<20 + 1
+		//valSize := 64<<20 + 1
 		txnSet(b, db, BuildEntry(key, uint64(valSize)), 0)
 	}
 

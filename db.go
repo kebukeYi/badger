@@ -1009,6 +1009,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 		// 2. vlog.db.batchSet(wb);
 		case r = <-db.writeCh:
 		case <-lc.HasBeenClosed():
+			fmt.Println("handleWriteCh exit-1")
 			goto closedCase
 		}
 
@@ -1027,6 +1028,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 			case pendingCh <- struct{}{}:
 				goto writeCase
 			case <-lc.HasBeenClosed():
+				fmt.Println("handleWriteCh exit-2")
 				goto closedCase
 			}
 		}

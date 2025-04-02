@@ -1,9 +1,6 @@
 module github.com/dgraph-io/badger/v4
 
 go 1.21
-
-toolchain go1.23.2
-
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/ristretto/v2 v2.1.0
@@ -16,7 +13,7 @@ require (
 	go.opencensus.io v0.24.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.29.0
-	google.golang.org/protobuf v1.36.3
+	google.golang.org/protobuf v1.36.6
 )
 
 require (
